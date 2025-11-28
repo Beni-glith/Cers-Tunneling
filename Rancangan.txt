@@ -1,0 +1,507 @@
+Buat **satu script Bash all-in-one** untuk VPS Ubuntu yang mengelola:
+
+* **OpenSSH, Dropbear, XRAY (VMESS, VLESS, TROJAN), OpenVPN (SSL/TCP/UDP), BadVPN UDPGW, SSH WebSocket (WS & WSS)**
+* Manajemen akun, monitoring, fix menu, backup/restore, limit user, fitur admin, **serta auto backup ke bot Telegram setiap 12 jam**.
+
+Script hanya untuk penggunaan **legal** (administrasi server pribadi/corporate/lab yang sah).
+
+---
+
+### 0️⃣ Target Environment & Standar Script
+
+* OS minimal: **Ubuntu 20.04 / 22.04**, arsitektur **x86_64/amd64**
+* Shebang: `#!/usr/bin/env bash`
+* Script berbasis fungsi, contoh:
+
+```bash
+check_root()
+check_os()
+install_dependencies()
+install_openssh()
+install_dropbear()
+install_xray()
+install_openvpn()
+install_badvpn()
+install_websocket_services()
+
+show_main_menu()
+show_ssh_menu()
+show_xray_menu()
+show_trojan_menu()
+show_backup_menu()
+show_maintenance_menu()
+show_information_menu()
+show_features_menu()
+
+troubleshooting_menu()
+logs_menu()
+backup_configs()
+restore_configs()
+auto_backup_setup()
+
+send_backup_to_telegram()
+```
+
+* Wajib ada:
+
+  * Cek root, cek OS, cek arsitektur.
+  * Error handling sederhana (cek exit code, cetak `[ERROR]` jika gagal).
+  * Komentar jelas di blok penting.
+
+---
+
+### 1️⃣ Port & Layanan Wajib
+
+Gunakan port dan layanan berikut (boleh dibuat variabel di bagian atas script):
+
+* **OpenSSH : 22**
+* **Dropbear : 143, 109**
+* **DropbearWS : 443, 109**  (WebSocket depan Dropbear)
+* **SSH UDP : 1–65535**
+
+  * Implementasi servis “SSH over UDP” (misalnya via UDP forwarder).
+  * Sediakan menu untuk mengaktifkan/menonaktifkan serta memilih port/range.
+* **OVPN SSL : 443**
+* **OVPN TCP : 1194**
+* **OVPN UDP : 2200**
+* **BadVPN : 7100, 7300**  (badvpn-udpgw minimal di kedua port ini)
+* **SSH WS : 80, 8080**
+* **SSH WS SSL : 443**
+
+Tambahan XRAY:
+
+* Buat inbound XRAY (VMESS/VLESS/TROJAN) di port yang wajar.
+* Semua port ini harus tampil di menu “Info Service Port”.
+* Jika firewall aktif (ufw/iptables), script otomatis membuka port-port tersebut (tanpa menonaktifkan firewall total).
+
+---
+
+### 2️⃣ Komponen Tunneling
+
+**A. OpenSSH**
+
+* Install & aktifkan service di port 22.
+* Menu:
+
+  * Tambah user, delete user, renew, trial account.
+  * Cek user yang sedang login.
+  * Tampilkan list member & list akun expired.
+
+**B. Dropbear + Dropbear WS**
+
+* Jalankan dropbear di port 143 & 109.
+* Tambahkan lapisan WebSocket di 443 dan 109 yang forward ke Dropbear.
+* Menu mirip SSH: status service, port listening, dll.
+
+**C. XRAY Core (VMESS, VLESS, TROJAN)**
+
+* Install Xray-core.
+* `config.json` misal di `/usr/local/etc/xray/config.json`.
+* Inbound minimal:
+
+  * VMESS (WS atau TCP)
+  * VLESS (WS/TLS sederhana)
+  * TROJAN (port khusus)
+* Setiap user:
+
+  * VMESS/VLESS → UUID
+  * TROJAN → password random
+* Menu manajemen akun per protokol (lihat bagian “Menu XRAY”).
+
+**D. OpenVPN**
+
+* Install & setup OpenVPN:
+
+  * OVPN SSL di port 443
+  * OVPN TCP di port 1194
+  * OVPN UDP di port 2200
+* Script:
+
+  * Generate server config.
+  * Generate key/cert minimal.
+  * Buat file client `.ovpn` sample untuk masing-masing (SSL/TCP/UDP).
+* Menu:
+
+  * Start/stop/restart.
+  * Tampilkan list client (kalau memungkinkan).
+  * Regenerasi client config.
+
+**E. BadVPN UDPGW**
+
+* Install badvpn-udpgw.
+* Jalankan instance:
+
+  * Port 7100
+  * Port 7300
+* Buat systemd service agar auto start.
+* Menu:
+
+  * Start/stop/restart.
+  * Cek apakah port 7100 & 7300 listening.
+
+**F. SSH WebSocket & WSS**
+
+* Layanan untuk:
+
+  * SSH WS di port **80 & 8080**.
+  * SSH WS SSL di port **443**.
+* Boleh lewat nginx atau daemon kecil yang forward WS → SSH/Dropbear.
+* Tambahkan komentar singkat cara koneksi dari sisi client.
+
+---
+
+### 3️⃣ Dashboard Utama (Tanpa Nama Khusus)
+
+Saat script dijalankan, sebelum menu utama, tampilkan **dashboard** dengan header generik, misalnya:
+
+```text
+:::. AUTO TUNNEL MANAGER .:::
+```
+
+Isi dashboard:
+
+* Box informasi sistem:
+
+  * SYSTEM  : Ubuntu versi
+  * RAM     : total MB
+  * UPTIME  : uptime
+  * IP VPS  : IP public
+  * CITY    : kota (boleh placeholder)
+  * ISP     : ISP (boleh placeholder)
+  * DOMAIN  : domain XRAY/PROXY
+  * YOUR PING : ping ke domain/host tertentu
+* Status layanan:
+
+  * `PROXY : ON/OFF | NGINX : ON/OFF | XRAY : ON/OFF | GOOD/BAD`
+* Statistik akun:
+
+  * SSH/OPENVPN : jumlah akun aktif
+  * VLESS XRAY  : jumlah akun
+  * VMESS XRAY  : jumlah akun
+  * TROJAN XRAY : jumlah akun
+  * SSR-LIBEV   : boleh 0/opsional
+* Info lisensi/klien:
+
+  * VERSION : misal `4.0 LTS` (boleh diset variabel)
+  * CLIENTS : nama server / pemilik
+  * Expiry In : sisa hari (boleh hitung dari file license)
+* Statistik bandwidth (opsional):
+
+  * `KEMARIN | HARI INI | BULANAN` dalam GB (boleh ambil dari `vnstat` atau file lain).
+
+Di bawah dashboard, tampilkan menu utama:
+
+* [01] SSH/OPENVPN
+* [02] XRAY MANAGER
+* [03] XRAY TROJAN
+* [04] SLOWDNS (boleh stub)
+* [05] NOOBZVPNS (boleh stub)
+* [06] SS-R (boleh stub)
+* [07] BOT TELEGRAM (opsional: konfigurasi token/chat id)
+* [08] UPDATE SCRIPT
+* [09] BACKUP RESTORE
+* [10] FEATURES
+* [11] FEATURES ADMIN
+* [x] EXIT
+
+Input: `Select From option [1/11 or x] :`
+
+---
+
+### 4️⃣ Menu “FEATURES”
+
+Submenu FEATURES:
+
+1. Running Service  → status singkat semua service utama.
+2. Restart Service → restart semua service utama (SSH, Dropbear, XRAY, OpenVPN, nginx/ws, badvpn).
+3. Auto Reboot → atur jadwal auto reboot (cron) & tampilkan status.
+4. Monitoring → info load, ram, top service, dll.
+5. SpeedTest → jalankan speedtest CLI (atau utilitas sederhana).
+6. Delete All Account Exp → hapus seluruh akun expired (SSH, XRAY, OpenVPN).
+
+---
+
+### 5️⃣ Menu “MENU FIXX”
+
+7. Change Banner  → ubah banner SSH/Dropbear dari file teks.
+8. Change Domain  → ubah domain XRAY/PROXY dalam config.
+9. Fixx Haproxy   → perbaiki/restart haproxy (opsional/stub).
+10. Fixx Nginx     → cek config & restart Nginx.
+11. Fixx WS ePRO   → perbaiki service WS/ePRO.
+12. Fixx Domain    → reapply domain (update cert/dns bila perlu).
+13. Fixx Xray      → cek & perbaiki config/service Xray (reload template default).
+
+---
+
+### 6️⃣ Menu “MENU CLEAR”
+
+14. Clear Cache       → hapus cache yang aman (temporary, file sementara).
+15. Clear Logs        → rotasi/hapus log besar (Xray, OpenVPN, dsb).
+16. Clear Cache File  → hapus cache tambahan (jelaskan di komentar).
+
+---
+
+### 7️⃣ Menu “INFORMATION”
+
+17. Info Service Port     → tampilkan daftar port semua layanan (SSH, Dropbear, OpenVPN, XRAY, BadVPN, WS, WSS, dll).
+18. Information System    → detail sistem (OS, kernel, CPU, RAM, disk, uptime, IP, ISP, dll).
+19. List Open Source & List Sewa Script → info lisensi, sumber script, atau list klien (boleh sederhana).
+
+---
+
+### 8️⃣ Menu “OTHER”
+
+20. Anti-DDoS Protection
+
+    * Terapkan rule ringan iptables/sysctl (anti syn flood dasar, dll) secara aman.
+21. Script Other
+
+    * Placeholder script tambahan.
+22. Limit Speed
+
+    * Konsep limit bandwidth (tc/traffic control sederhana atau placeholder + komentar).
+23. Limit-on-off XRAY
+
+    * Aktif/nonaktifkan limit (IP/bandwidth) untuk XRAY.
+24. Booster CPU (multi-threading)
+
+    * Set sysctl ringan aman (tanpa merusak sistem).
+25. Back to Menu
+    x.  EXIT
+
+---
+
+### 9️⃣ Menu Backup & Restore (Konfigurasi + Data User Saja)
+
+**PENTING:**
+Backup **bukan** full VPS, tapi **hanya data yang terkait script**, yaitu:
+
+* File konfigurasi layanan yang diubah/script:
+
+  * Xray config
+  * OpenVPN server config + template client
+  * Konfigurasi SSH/Dropbear yang relevan
+  * Konfigurasi BadVPN, WS, Nginx, dll (jika ada)
+* **Database / file data user** yang menyimpan:
+
+  * Username
+  * Masa aktif/expired
+  * Sisa limit bandwidth (jika ada)
+  * Limit IP / lock/unlock status, dll
+
+Contoh: semua data ini dikumpulkan ke folder misal `/etc/autotunnel/data/` lalu di-archive.
+
+Submenu **Backup & Restore**:
+
+* [01] Backup VPS Data
+
+  * Compress konfigurasi & data user ke satu file `.tar.gz`.
+* [02] Restore VPS Data
+
+  * Restore file backup (kembalikan config & database user ke tempatnya).
+* [03] Auto Backup VPS
+
+  * Atur & tampilkan status auto backup (termasuk integrasi ke Telegram).
+
+[b] Back to Menu
+[x] EXIT
+
+---
+
+### 🔟 Auto Backup + Kirim ke Bot Telegram (Setiap 12 Jam)
+
+Tambahkan bagian konfigurasi di awal script:
+
+```bash
+TELEGRAM_BOT_TOKEN="isi-token-bot-di-sini"
+TELEGRAM_CHAT_ID="isi-chat-id-admin-di-sini"
+BACKUP_DIR="/var/backups/autotunnel"
+BACKUP_FILE_NAME="autotunnel-backup-$(date +%Y%m%d-%H%M).tar.gz"
+```
+
+**Fungsi yang wajib ada:**
+
+1. `backup_configs()`
+
+   * Membuat folder backup jika belum ada.
+   * Meng-archive **hanya**:
+
+     * File konfigurasi layanan yang relevan.
+     * File database/user data (masa aktif, limit, dll).
+   * Menyimpan `.tar.gz` ke `$BACKUP_DIR`.
+
+2. `send_backup_to_telegram()`
+
+   * Menggunakan `curl` ke endpoint:
+     `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument`
+   * Mengirim file backup terbaru sebagai **document** ke `$TELEGRAM_CHAT_ID`.
+   * Jika `TELEGRAM_BOT_TOKEN` atau `TELEGRAM_CHAT_ID` kosong, tampilkan `[ERROR]` dan jangan kirim.
+
+3. `auto_backup_setup()`
+
+   * Setelah script selesai di-install / pertama kali dijalankan dengan mode “install”, buat **cron job** otomatis:
+
+     * Interval tiap **12 jam sekali**.
+     * Contoh entry cron:
+
+       ```text
+       0 */12 * * * root /usr/local/bin/auto-tunnel.sh --auto-backup
+       ```
+
+   * Mode `--auto-backup` pada script akan:
+
+     * Memanggil `backup_configs`
+     * Lalu `send_backup_to_telegram`
+
+   * Tampilkan status apakah cron sudah terpasang & dimana script disimpan.
+
+---
+
+### 1️⃣1️⃣ Menu Manajemen Akun SSH–Dropbear–OpenVPN
+
+Header: **SSH–Dropbear–OpenVPN**
+
+1. Check Users Login
+2. Create Accounts
+3. Delete Accounts
+4. Renew Accounts
+5. Trial Accounts
+
+**MEMBER**
+
+6. List Member Accounts
+7. List Expired Accounts
+
+**LOCK & UNLOCK**
+
+8. Lock Accounts
+9. Unlock Accounts
+
+**LIMIT**
+
+10. Edit Limit IP Account
+11. Limit IP On Off Accounts
+
+**OTHER**
+
+12. Auto Kill Accounts (kill user melanggar limit/multilogin)
+
+13. Detail Accounts (info 1 akun)
+
+14. Recovery Accounts (aktifkan kembali akun yang tersimpan di database backup local)
+
+15. Check Login UDP
+
+16. Back to Menu
+    x.  Exit
+
+---
+
+### 1️⃣2️⃣ Menu XRAY (VMESS, VLESS) & TROJAN
+
+**XRAY (global)**
+
+1. Check Users Login
+2. List Member
+
+**XRAY VMESS**
+
+3. Create Account Vmess
+4. Trial Account Vmess
+5. Delete Account Vmess
+6. Renew Account Vmess
+7. Check Config Account
+8. Recovery Account
+9. Edit Limit IP Account
+10. Edit Limit Bandwidth Account
+11. Lock Account
+12. Unlock Account
+
+**XRAY VLESS**
+
+13. Create Account Vless
+
+14. Trial Account Vless
+
+15. Delete Account Vless
+
+16. Renew Account Vless
+
+17. Check Config Account
+
+18. Recovery Account
+
+19. Edit Limit IP Account
+
+20. Edit Limit Bandwidth Account
+
+21. Lock Account
+
+22. Unlock Account
+
+23. Back to Menu
+    x.  Exit
+
+**Menu XRAY TROJAN**
+
+1. Check Users Login
+2. List Member Trojan
+3. Create Account Trojan
+4. Trial Account Trojan
+5. Delete Account Trojan
+6. Renew Account Trojan
+7. Check Config Account
+8. Recovery Account
+9. Edit Limit IP Account
+10. Edit Limit Bandwidth Account
+11. Lock Account
+12. Unlock Account
+13. Back to Menu
+    x.  Exit
+
+Semua perubahan pada akun (create/renew/delete/limit/lock/unlock) harus juga **mengupdate database lokal** yang dipakai untuk backup (masa aktif, limit, status).
+
+---
+
+### 1️⃣3️⃣ Troubleshooting & Logs
+
+`troubleshooting_menu()` minimal:
+
+* Cek status service: ssh/sshd, dropbear, xray, openvpn, badvpn, nginx/ws, dll.
+* Cek port (22, 143, 109, 443, 1194, 2200, 7100, 7300, 80, 8080, dsb) dengan `ss`/`netstat`.
+* Validasi sederhana config Xray (pakai `jq` jika ada).
+* Tampilkan beberapa baris log terakhir: Xray, SSH/auth, OpenVPN.
+* Beri rekomendasi singkat (restart, cek firewall, cek config).
+
+`logs_menu()` opsional untuk akses cepat log per service.
+
+---
+
+### 1️⃣4️⃣ Helper & Utilitas
+
+Tambahkan:
+
+* `generate_uuid()` → user VMESS/VLESS.
+* `generate_random_password()` → TROJAN & akun lain.
+* `generate_random_port()` (opsional).
+* Fungsi `info()`, `ok()`, `error()` untuk echo dengan prefix `[INFO]`, `[OK]`, `[ERROR]`.
+* Fungsi dekorasi menu (garis, warna ANSI opsional).
+
+---
+
+### 1️⃣5️⃣ Output yang Diminta
+
+Jawabanmu harus berupa:
+
+1. **Satu code block Bash lengkap** berisi script, misalnya bernama `auto-tunnel.sh`.
+2. Di bagian paling atas script, beri komentar:
+
+   * Cara menjalankan: `chmod +x auto-tunnel.sh` lalu `./auto-tunnel.sh`.
+   * Peringatan penggunaan legal.
+3. Script tidak harus diuji, tetapi:
+
+   * Sintaks Bash konsisten.
+   * Struktur menu & fungsi jelas.
+   * Semua fitur yang belum full production boleh diberi komentar `TODO`, **tetapi kerangka & alur sudah nyata**.
+
+**Akhiri jawabanmu hanya dengan satu code block yang berisi script Bash lengkap (tanpa penjelasan tambahan di luar code block).**
