@@ -12,6 +12,7 @@ SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STATE_DIR="/etc/tunneling"
 STATE_FILE="$STATE_DIR/settings.conf"
 PERMISSION_FLAG_FILE="$STATE_DIR/.permission_granted"
+IP_ALLOWLIST_FILE="$STATE_DIR/allowed_ips"
 BACKUP_CRON="/etc/cron.d/auto-backup-tunnel"
 
 info() { echo "[INFO] $*"; }
@@ -62,6 +63,33 @@ configure_authorization() {
   ok "Izin disimpan; kode akan diverifikasi pada penggunaan pertama."
 }
 
+detect_public_ip() {
+  local ip
+  ip=$(curl -s https://api.ipify.org 2>/dev/null || true)
+  if [[ -z "$ip" ]]; then
+    ip=$(curl -s https://ifconfig.me 2>/dev/null || true)
+  fi
+  echo "$ip"
+}
+
+configure_ip_allowlist() {
+  mkdir -p "$STATE_DIR"
+  local current_ip ip_list
+  current_ip=$(detect_public_ip)
+  info "IP publik terdeteksi: ${current_ip:-tidak terdeteksi}"
+  read -rp "Daftar IP yang diizinkan (pisahkan dengan spasi) [default: ${current_ip:-wajib isi}]: " ip_list
+  if [[ -z "$ip_list" && -n "$current_ip" ]]; then
+    ip_list="$current_ip"
+  fi
+  if [[ -z "$ip_list" ]]; then
+    error "Minimal satu IP harus dicantumkan dalam daftar izin."
+    exit 1
+  fi
+  tr ' ' '\n' <<<"$ip_list" | sed '/^$/d' | sort -u >"$IP_ALLOWLIST_FILE"
+  chmod 600 "$IP_ALLOWLIST_FILE"
+  ok "Daftar izin IP disimpan di $IP_ALLOWLIST_FILE."
+}
+
 configure_telegram() {
   read -rp "Masukkan TOKEN BOT TELEGRAM ADMIN: " bot
   read -rp "Masukkan CHAT ID TELEGRAM ADMIN: " chat
@@ -100,6 +128,7 @@ main() {
   check_root
   check_requirements
   install_files
+  configure_ip_allowlist
   configure_authorization
   configure_telegram
   setup_auto_backup_cron
