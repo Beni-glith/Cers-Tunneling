@@ -28,12 +28,14 @@ XRAY_TROJAN_PORT=8445
 XRAY_CONFIG="/usr/local/etc/xray/config.json"
 TELEGRAM_BOT_TOKEN=""
 TELEGRAM_CHAT_ID=""
+PERMISSION_TOKEN=""
 AUTO_BACKUP_INTERVAL_HOURS=12
 BACKUP_DIR="/var/backups/tunneling"
 LOCAL_DB="/var/lib/tunneling/accounts.json"
 STATE_DIR="/etc/tunneling"
 SSH_UDP_STATE_FILE="$STATE_DIR/ssh_udp_ports"
 STATE_FILE="$STATE_DIR/settings.conf"
+PERMISSION_FLAG_FILE="$STATE_DIR/.permission_granted"
 ACTIVE_DROPBEAR_WS_PORT1="$DROPBEAR_WS_PORT1"
 ACTIVE_DROPBEAR_WS_PORT2="$DROPBEAR_WS_PORT2"
 ACTIVE_SSH_WS_SSL_PORT="$SSH_WS_SSL_PORT"
@@ -102,6 +104,7 @@ JSON
   [[ -f "$STATE_FILE" ]] || touch "$STATE_FILE"
   TELEGRAM_BOT_TOKEN=$(get_state telegram_bot_token "$TELEGRAM_BOT_TOKEN")
   TELEGRAM_CHAT_ID=$(get_state telegram_chat_id "$TELEGRAM_CHAT_ID")
+  PERMISSION_TOKEN=$(get_state permission_token "")
 }
 
 # === Validasi Awal ===
@@ -180,6 +183,50 @@ set_state() {
 get_state() {
   local key=$1 default=${2:-off}
   grep -E "^${key}=" "$STATE_FILE" | tail -n1 | cut -d'=' -f2- || echo "$default"
+}
+
+ensure_telegram_configured() {
+  if [[ -z "$TELEGRAM_BOT_TOKEN" || -z "$TELEGRAM_CHAT_ID" ]]; then
+    if [[ -t 0 ]]; then
+      info "Konfigurasi Telegram belum lengkap."
+      configure_telegram_bot
+    else
+      error "Konfigurasi Telegram kosong; tidak dapat melanjutkan di mode non-interaktif."
+      return 1
+    fi
+  fi
+  return 0
+}
+
+ensure_permission() {
+  if [[ -z "${PERMISSION_TOKEN:-}" ]]; then
+    error "Kode izin belum disetel. Jalankan installer dan masukkan kode izin admin."
+    exit 1
+  fi
+
+  if [[ -f "$PERMISSION_FLAG_FILE" ]]; then
+    local stored
+    stored=$(cat "$PERMISSION_FLAG_FILE")
+    if [[ "$stored" == "$PERMISSION_TOKEN" ]]; then
+      return 0
+    fi
+  fi
+
+  if [[ -t 0 ]]; then
+    local input
+    read -rsp "Masukkan kode izin admin: " input
+    echo
+    if [[ "$input" != "$PERMISSION_TOKEN" ]]; then
+      error "Kode izin salah."
+      exit 1
+    fi
+    echo "$PERMISSION_TOKEN" >"$PERMISSION_FLAG_FILE"
+    chmod 600 "$PERMISSION_FLAG_FILE"
+    ok "Izin diverifikasi."
+  else
+    error "Izin belum diverifikasi dan tidak dapat meminta input di mode non-interaktif."
+    exit 1
+  fi
 }
 
 # === OpenSSH ===
@@ -829,10 +876,10 @@ restore_configs() {
 }
 
 send_backup_to_telegram() {
+  ensure_telegram_configured || return 1
   local latest
   latest=$(ls -t "$BACKUP_DIR"/backup-*.tar.gz 2>/dev/null | head -n1)
   [[ -z "$latest" ]] && { error "Tidak ada backup"; return 1; }
-  [[ -z "$TELEGRAM_BOT_TOKEN" || -z "$TELEGRAM_CHAT_ID" ]] && { error "Bot token/Chat ID kosong"; return 1; }
   curl -s -F chat_id="$TELEGRAM_CHAT_ID" -F document=@"$latest" "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendDocument" >/dev/null || error "Kirim backup gagal"
 }
 
@@ -845,6 +892,8 @@ configure_telegram_bot() {
 }
 
 auto_backup_setup() {
+  ensure_permission
+  ensure_telegram_configured || return 1
   mkdir -p "$BACKUP_DIR"
   cat >/etc/cron.d/auto-backup-tunnel <<CRON
 0 */$AUTO_BACKUP_INTERVAL_HOURS * * * root $(readlink -f "$0") --auto-backup
@@ -1441,11 +1490,11 @@ show_main_menu() { show_dashboard; }
 # === Entry Point ===
 case "${1:-menu}" in
   --auto-backup)
-    check_root; check_os; check_arch; init_state
+    check_root; check_os; check_arch; init_state; ensure_permission; ensure_telegram_configured
     backup_configs && send_backup_to_telegram
     ;;
   install)
-    check_root; check_os; check_arch; init_state
+    check_root; check_os; check_arch; init_state; ensure_permission
     install_dependencies
     install_openssh
     install_dropbear
@@ -1460,7 +1509,7 @@ case "${1:-menu}" in
     ok "Instalasi selesai."
     ;;
   menu|*)
-    check_root; check_os; check_arch; init_state
+    check_root; check_os; check_arch; init_state; ensure_permission
     show_dashboard
     ;;
 esac
