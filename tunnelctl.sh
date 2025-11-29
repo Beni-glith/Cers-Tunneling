@@ -11,6 +11,7 @@ OPENSSH_PORT=22
 DROPBEAR_PORT1=143
 DROPBEAR_PORT2=109
 DROPBEAR_WS_PORT1=443
+DROPBEAR_WS_PORT1_FALLBACK=8443
 DROPBEAR_WS_PORT2=109
 SSH_UDP_DEFAULT_PORT=7300
 OVPN_SSL_PORT=443
@@ -19,6 +20,7 @@ OVPN_UDP_PORT=2200
 BADVPN_PORTS=(7100 7300)
 SSH_WS_PORTS=(80 8080)
 SSH_WS_SSL_PORT=443
+SSH_WS_SSL_PORT_FALLBACK=4443
 XRAY_CONFIG="/usr/local/etc/xray/config.json"
 TELEGRAM_BOT_TOKEN=""
 TELEGRAM_CHAT_ID=""
@@ -27,6 +29,9 @@ BACKUP_DIR="/var/backups/tunneling"
 LOCAL_DB="/var/lib/tunneling/accounts.json"
 STATE_DIR="/etc/tunneling"
 SSH_UDP_STATE_FILE="$STATE_DIR/ssh_udp_ports"
+ACTIVE_DROPBEAR_WS_PORT1="$DROPBEAR_WS_PORT1"
+ACTIVE_DROPBEAR_WS_PORT2="$DROPBEAR_WS_PORT2"
+ACTIVE_SSH_WS_SSL_PORT="$SSH_WS_SSL_PORT"
 
 # === Utilitas Output ===
 info() { echo "[INFO] $*"; }
@@ -34,6 +39,21 @@ ok() { echo "[OK] $*"; }
 error() { echo "[ERROR] $*" >&2; }
 line() { printf '%*s\n' "${1:-60}" '' | tr ' ' '='; }
 require_cmd() { command -v "$1" >/dev/null 2>&1 || { error "Perintah '$1' tidak tersedia."; exit 1; }; }
+
+ensure_port_available() {
+  local port=$1 proto=$2 fallback=${3:-}
+  if ss -lntup | grep -q ":$port " 2>/dev/null; then
+    if [[ -n "$fallback" ]]; then
+      info "Port $port/$proto sedang digunakan, menggunakan port cadangan $fallback."
+      echo "$fallback"
+    else
+      error "Port $port/$proto sedang digunakan."
+      return 1
+    fi
+  else
+    echo "$port"
+  fi
+}
 
 # === Helper ===
 generate_uuid() { uuidgen; }
@@ -76,15 +96,22 @@ check_arch() {
 install_dependencies() {
   info "Memperbarui paket dan menginstal dependensi..."
   apt-get update
-  DEBIAN_FRONTEND=noninteractive apt-get install -y jq moreutils curl wget unzip net-tools openssl iptables-persistent ufw dropbear openvpn easy-rsa xray socat cron || {
+  DEBIAN_FRONTEND=noninteractive apt-get install -y jq moreutils curl wget unzip net-tools openssl iptables-persistent ufw dropbear openvpn easy-rsa socat cron uuid-runtime build-essential cmake git || {
     error "Gagal menginstal dependensi."
     exit 1
   }
+  if ! command -v xray >/dev/null 2>&1; then
+    info "Xray tidak ditemukan, memasang via installer resmi..."
+    bash <(curl -Ls https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh) install || {
+      error "Instalasi Xray gagal."
+      exit 1
+    }
+  fi
 }
 
 # === Firewall ===
 open_firewall_ports() {
-  local ports=("$OPENSSH_PORT" "$DROPBEAR_PORT1" "$DROPBEAR_PORT2" "$DROPBEAR_WS_PORT1" "$DROPBEAR_WS_PORT2" "$OVPN_SSL_PORT" "$OVPN_TCP_PORT" "$OVPN_UDP_PORT" "${BADVPN_PORTS[@]}" "${SSH_WS_PORTS[@]}" "$SSH_WS_SSL_PORT")
+  local ports=("$OPENSSH_PORT" "$DROPBEAR_PORT1" "$DROPBEAR_PORT2" "$ACTIVE_DROPBEAR_WS_PORT1" "$ACTIVE_DROPBEAR_WS_PORT2" "$OVPN_SSL_PORT" "$OVPN_TCP_PORT" "$OVPN_UDP_PORT" "${BADVPN_PORTS[@]}" "${SSH_WS_PORTS[@]}" "$ACTIVE_SSH_WS_SSL_PORT")
   for p in "${ports[@]}"; do
     ufw allow "$p" >/dev/null 2>&1 || true
     iptables -I INPUT -p tcp --dport "$p" -j ACCEPT || true
@@ -188,13 +215,18 @@ install_dropbear() {
 # === Dropbear WebSocket ===
 install_dropbear_ws() {
   info "Menyiapkan WebSocket untuk Dropbear..."
+  local ws1 ws2
+  ws1=$(ensure_port_available "$DROPBEAR_WS_PORT1" tcp "$DROPBEAR_WS_PORT1_FALLBACK") || return 1
+  ws2=$(ensure_port_available "$DROPBEAR_WS_PORT2" tcp) || return 1
+  ACTIVE_DROPBEAR_WS_PORT1="$ws1"
+  ACTIVE_DROPBEAR_WS_PORT2="$ws2"
   cat >/etc/systemd/system/dropbear-ws.service <<WS
 [Unit]
-Description=Dropbear WebSocket Proxy 443->${DROPBEAR_PORT1}
+Description=Dropbear WebSocket Proxy ${ws1}->${DROPBEAR_PORT1}
 After=network.target
 
 [Service]
-ExecStart=/usr/bin/socat TCP-LISTEN:${DROPBEAR_WS_PORT1},reuseaddr,fork TCP:127.0.0.1:${DROPBEAR_PORT1}
+ExecStart=/usr/bin/socat TCP-LISTEN:${ws1},reuseaddr,fork TCP:127.0.0.1:${DROPBEAR_PORT1}
 Restart=always
 
 [Install]
@@ -202,11 +234,11 @@ WantedBy=multi-user.target
 WS
   cat >/etc/systemd/system/dropbear-ws109.service <<WS2
 [Unit]
-Description=Dropbear WebSocket Proxy 109->${DROPBEAR_PORT2}
+Description=Dropbear WebSocket Proxy ${ws2}->${DROPBEAR_PORT2}
 After=network.target
 
 [Service]
-ExecStart=/usr/bin/socat TCP-LISTEN:${DROPBEAR_WS_PORT2},reuseaddr,fork TCP:127.0.0.1:${DROPBEAR_PORT2}
+ExecStart=/usr/bin/socat TCP-LISTEN:${ws2},reuseaddr,fork TCP:127.0.0.1:${DROPBEAR_PORT2}
 Restart=always
 
 [Install]
@@ -483,6 +515,15 @@ OVPN
 # === BadVPN ===
 install_badvpn() {
   info "Menjalankan BadVPN UDPGW..."
+  if ! command -v badvpn-udpgw >/dev/null 2>&1; then
+    info "Binary badvpn-udpgw tidak ditemukan, mengompilasi dari sumber..."
+    tmpdir=$(mktemp -d)
+    git clone --depth=1 https://github.com/ambrop72/badvpn.git "$tmpdir" >/dev/null 2>&1
+    cmake -S "$tmpdir" -B "$tmpdir/build" -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1 >/dev/null
+    cmake --build "$tmpdir/build" >/dev/null
+    install -m 0755 "$tmpdir/build/udpgw/badvpn-udpgw" /usr/local/bin/badvpn-udpgw
+    rm -rf "$tmpdir"
+  fi
   for p in "${BADVPN_PORTS[@]}"; do
     cat >/etc/systemd/system/badvpn@$p.service <<BAD
 [Unit]
@@ -504,6 +545,9 @@ BAD
 # === WebSocket SSH ===
 install_websocket_services() {
   info "Menyiapkan SSH WebSocket..."
+  local wss_port
+  wss_port=$(ensure_port_available "$SSH_WS_SSL_PORT" tcp "$SSH_WS_SSL_PORT_FALLBACK") || return 1
+  ACTIVE_SSH_WS_SSL_PORT="$wss_port"
   for port in "${SSH_WS_PORTS[@]}"; do
     cat >/etc/systemd/system/ssh-ws@$port.service <<WSS
 [Unit]
@@ -526,7 +570,7 @@ Description=SSH WebSocket TLS
 After=network.target
 
 [Service]
-ExecStart=/usr/bin/socat TCP-LISTEN:$SSH_WS_SSL_PORT,reuseaddr,fork TCP:127.0.0.1:$OPENSSH_PORT
+ExecStart=/usr/bin/socat TCP-LISTEN:$wss_port,reuseaddr,fork TCP:127.0.0.1:$OPENSSH_PORT
 Restart=always
 
 [Install]
@@ -624,14 +668,14 @@ show_service_info() {
   line
   echo "OpenSSH        : $OPENSSH_PORT"
   echo "Dropbear       : $DROPBEAR_PORT1, $DROPBEAR_PORT2"
-  echo "Dropbear WS    : $DROPBEAR_WS_PORT1, $DROPBEAR_WS_PORT2"
+  echo "Dropbear WS    : $ACTIVE_DROPBEAR_WS_PORT1, $ACTIVE_DROPBEAR_WS_PORT2"
   echo "SSH over UDP   : $(tr '\n' ' ' <"$SSH_UDP_STATE_FILE" 2>/dev/null || echo "$SSH_UDP_DEFAULT_PORT")"
   echo "OpenVPN SSL    : $OVPN_SSL_PORT"
   echo "OpenVPN TCP    : $OVPN_TCP_PORT"
   echo "OpenVPN UDP    : $OVPN_UDP_PORT"
   echo "BadVPN UDPGW   : ${BADVPN_PORTS[*]}"
   echo "SSH WS         : ${SSH_WS_PORTS[*]}"
-  echo "SSH WS SSL     : $SSH_WS_SSL_PORT"
+  echo "SSH WS SSL     : $ACTIVE_SSH_WS_SSL_PORT"
   echo "XRAY (VMESS)   : 8443"
   echo "XRAY (VLESS)   : 8444"
   echo "XRAY (TROJAN)  : 8445"
