@@ -524,6 +524,8 @@ install_badvpn() {
     install -m 0755 "$tmpdir/build/udpgw/badvpn-udpgw" /usr/local/bin/badvpn-udpgw
     rm -rf "$tmpdir"
   fi
+  local badvpn_bin
+  badvpn_bin=$(command -v badvpn-udpgw || echo /usr/local/bin/badvpn-udpgw)
   for p in "${BADVPN_PORTS[@]}"; do
     cat >/etc/systemd/system/badvpn@$p.service <<BAD
 [Unit]
@@ -531,7 +533,7 @@ Description=BadVPN UDPGW on port $p
 After=network.target
 
 [Service]
-ExecStart=/usr/bin/badvpn-udpgw --listen-addr 0.0.0.0:$p --max-clients 2048
+ExecStart=${badvpn_bin} --listen-addr 0.0.0.0:$p --max-clients 2048
 Restart=always
 
 [Install]
@@ -921,7 +923,7 @@ MENU
 # === Entry Point ===
 case "${1:-menu}" in
   --auto-backup)
-    init_state
+    check_root; check_os; check_arch; init_state
     backup_configs && send_backup_to_telegram
     ;;
   install)
@@ -940,7 +942,7 @@ case "${1:-menu}" in
     ok "Instalasi selesai."
     ;;
   menu|*)
-    init_state
+    check_root; check_os; check_arch; init_state
     show_main_menu
     ;;
 esac
