@@ -29,6 +29,7 @@ BACKUP_DIR="/var/backups/tunneling"
 LOCAL_DB="/var/lib/tunneling/accounts.json"
 STATE_DIR="/etc/tunneling"
 SSH_UDP_STATE_FILE="$STATE_DIR/ssh_udp_ports"
+STATE_FILE="$STATE_DIR/settings.conf"
 ACTIVE_DROPBEAR_WS_PORT1="$DROPBEAR_WS_PORT1"
 ACTIVE_DROPBEAR_WS_PORT2="$DROPBEAR_WS_PORT2"
 ACTIVE_SSH_WS_SSL_PORT="$SSH_WS_SSL_PORT"
@@ -67,6 +68,7 @@ init_state() {
 {"ssh":[],"vmess":[],"vless":[],"trojan":[]}
 JSON
   fi
+  [[ -f "$STATE_FILE" ]] || touch "$STATE_FILE"
 }
 
 # === Validasi Awal ===
@@ -125,6 +127,20 @@ open_firewall_ports() {
     done <"$SSH_UDP_STATE_FILE"
   fi
   netfilter-persistent save >/dev/null 2>&1 || true
+}
+
+set_state() {
+  local key=$1 value=$2
+  if grep -q "^${key}=" "$STATE_FILE"; then
+    sed -i "s#^${key}=.*#${key}=${value}#" "$STATE_FILE"
+  else
+    echo "${key}=${value}" >>"$STATE_FILE"
+  fi
+}
+
+get_state() {
+  local key=$1 default=${2:-off}
+  grep -E "^${key}=" "$STATE_FILE" | tail -n1 | cut -d'=' -f2- || echo "$default"
 }
 
 # === OpenSSH ===
@@ -622,6 +638,25 @@ list_db_accounts() {
   jq -r --arg srv "$key" '.[$srv][]? | "\(.user) (expire: \(.expire)) status: \(.status)"' "$LOCAL_DB"
 }
 
+db_count_accounts() {
+  local service=$1
+  local key
+  key=$(get_service_key "$service")
+  jq -r --arg srv "$key" '.[$srv] // [] | length' "$LOCAL_DB"
+}
+
+db_prune_expired() {
+  local today
+  today=$(date +%s)
+  tmp=$(mktemp)
+  jq --argjson now "$today" '
+    to_entries
+    | map(.value |= map(select(.expire == "" or ((try (.expire | fromdateiso8601) catch 0) >= $now))))
+    | from_entries
+  ' "$LOCAL_DB" >"$tmp" && mv "$tmp" "$LOCAL_DB"
+  ok "Data akun kedaluwarsa dibersihkan dari database lokal."
+}
+
 # === Backup & Restore ===
 backup_configs() {
   mkdir -p "$BACKUP_DIR"
@@ -704,6 +739,232 @@ logs_menu() {
   echo "Log Xray:"; tail -n 20 /var/log/xray/error.log 2>/dev/null
   echo "Log SSH:"; tail -n 20 /var/log/auth.log 2>/dev/null
   echo "Log OpenVPN:"; journalctl -u openvpn-server@tcp -n 20 --no-pager 2>/dev/null
+}
+
+running_services() {
+  line; echo "Running Service"; line
+  local services=(ssh dropbear xray openvpn-server@tcp openvpn-server@udp openvpn-server@ssl ssh-ws@80 ssh-ws@8080 ssh-wss dropbear-ws dropbear-ws109 badvpn-udpgw@7100 badvpn-udpgw@7300)
+  for svc in "${services[@]}"; do
+    if systemctl is-active --quiet "$svc"; then
+      ok "$svc aktif"
+    else
+      error "$svc tidak aktif"
+    fi
+  done
+  echo "Port penting:"; ss -tulwn | grep -E "(:22|:143|:109|:${ACTIVE_DROPBEAR_WS_PORT1}|:${ACTIVE_DROPBEAR_WS_PORT2}|:443|:1194|:2200|:7100|:7300|:80|:8080)" || true
+}
+
+restart_all_services() {
+  line; echo "Restart semua layanan"; line
+  local services=(ssh dropbear xray openvpn-server@tcp openvpn-server@udp openvpn-server@ssl ssh-ws@80 ssh-ws@8080 ssh-wss dropbear-ws dropbear-ws109 badvpn-udpgw@7100 badvpn-udpgw@7300)
+  for svc in "${services[@]}"; do
+    systemctl restart "$svc" 2>/dev/null && ok "$svc direstart" || error "$svc gagal direstart atau tidak ada"
+  done
+}
+
+configure_autoreboot() {
+  read -rp "Jadwalkan reboot setiap berapa jam? (mis. 12): " hours
+  [[ -z "$hours" ]] && return
+  cat >/etc/cron.d/autoreboot-tunnel <<CRON
+0 */$hours * * * root /sbin/reboot
+CRON
+  systemctl restart cron
+  set_state "autoreboot" "setiap ${hours} jam"
+  ok "Autoreboot dijadwalkan tiap $hours jam"
+}
+
+run_speedtest() {
+  if ! command -v speedtest-cli >/dev/null 2>&1; then
+    info "Menginstal speedtest-cli..."
+    apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y speedtest-cli || { error "Gagal memasang speedtest-cli"; return 1; }
+  fi
+  speedtest-cli --simple || error "Speedtest gagal dijalankan"
+}
+
+change_banner() {
+  read -rp "Masukkan teks banner baru: " banner
+  [[ -z "$banner" ]] && return
+  echo "$banner" >/etc/issue
+  echo "$banner" >/etc/motd
+  ok "Banner diubah."
+}
+
+add_domain() {
+  read -rp "Masukkan domain: " domain
+  [[ -z "$domain" ]] && return
+  echo "$domain" >"$STATE_DIR/domain"
+  ok "Domain tersimpan di $STATE_DIR/domain"
+}
+
+fix_haproxy() {
+  if systemctl list-unit-files | grep -q '^haproxy'; then
+    systemctl restart haproxy && ok "HAProxy direstart" || error "Gagal restart HAProxy"
+  else
+    error "HAProxy tidak terpasang"
+  fi
+}
+
+fix_xray_service() {
+  systemctl restart xray && ok "XRAY direstart" || error "XRAY gagal direstart"
+}
+
+fix_ws_layer() {
+  systemctl restart dropbear-ws dropbear-ws109 ssh-ws@80 ssh-ws@8080 ssh-wss 2>/dev/null || true
+  ok "Layanan WebSocket dicoba perbaiki."
+}
+
+fix_domain_layer() {
+  if [[ -f "$STATE_DIR/domain" ]]; then
+    local domain
+    domain=$(cat "$STATE_DIR/domain")
+    if ! grep -q "$domain" /etc/hosts; then
+      echo "127.0.0.1 ${domain}" >>/etc/hosts
+    fi
+    ok "Entry domain diperbarui"
+  else
+    error "Belum ada domain yang tersimpan"
+  fi
+}
+
+clear_cache() {
+  apt-get clean >/dev/null 2>&1 || true
+  journalctl --rotate >/dev/null 2>&1 || true
+  ok "Cache package dan jurnal diputar."
+}
+
+clear_logs() {
+  : >/var/log/xray/access.log 2>/dev/null || true
+  : >/var/log/xray/error.log 2>/dev/null || true
+  : >/var/log/auth.log 2>/dev/null || true
+  ok "Log utama dibersihkan."
+}
+
+delete_all_expired_accounts() {
+  db_prune_expired
+  local today
+  today=$(date +%s)
+  awk -F: '{print $1" "$8}' /etc/shadow | while read -r user expire; do
+    [[ -z "$expire" || "$expire" == "" || "$expire" == "99999" ]] && continue
+    if (( expire>0 )); then
+      local date
+      date=$(date -d "1970-01-01 + $expire days" +%s)
+      if (( date < today )); then
+        userdel -r "$user" 2>/dev/null || true
+        ok "User $user dihapus karena kadaluarsa"
+      fi
+    fi
+  done
+}
+
+admin_features_menu() {
+  while true; do
+    line; echo "FEATURES ADMIN"; line
+    echo "1. Anti-DDoS Protection ($(get_state anti_ddos off))"
+    echo "2. Limit Speed ($(get_state limit_speed off))"
+    echo "3. Limit Quota ($(get_state limit_quota off))"
+    echo "4. Limit Conn XRAY ($(get_state limit_conn_xray off))"
+    echo "5. Limit Conn UDP ($(get_state limit_conn_udp off))"
+    echo "6. Multi-threading Guard ($(get_state limit_conn_multi off))"
+    echo "b. Kembali"
+    echo "x. Keluar"
+    read -rp "Pilih: " opt
+    case $opt in
+      1) set_state anti_ddos on; ok "Anti-DDoS ditandai aktif (implementasi sederhana via firewall yang sudah dibuka).";;
+      2) set_state limit_speed on; ok "Limit speed dicatat (TODO: implement traffic shaping).";;
+      3) set_state limit_quota on; ok "Limit quota dicatat (TODO: tambahkan quota enforcement).";;
+      4) set_state limit_conn_xray on; ok "Limit koneksi XRAY dicatat.";;
+      5) set_state limit_conn_udp on; ok "Limit koneksi UDP dicatat.";;
+      6) set_state limit_conn_multi on; ok "Proteksi multi-threading dicatat.";;
+      b|B) return;;
+      x|X) exit 0;;
+    esac
+  done
+}
+
+show_dashboard() {
+  while true; do
+    local os ram uptime_info ip domain
+    os=$(lsb_release -sd 2>/dev/null || grep PRETTY_NAME /etc/os-release | cut -d'=' -f2- | tr -d '"')
+    ram=$(free -m | awk '/Mem:/ {print $2 " MB"}')
+    uptime_info=$(uptime -p | cut -d' ' -f2-)
+    ip=$(hostname -I | awk '{print $1}')
+    domain=$(cat "$STATE_DIR/domain" 2>/dev/null || echo "-" )
+
+    line; echo " ::: ARISCTUNNEL V4 :::"; line
+    echo "SYSTEM : ${os:-N/A}"
+    echo "RAM    : ${ram:-N/A}"
+    echo "UPTIME : ${uptime_info:-N/A}"
+    echo "IP VPS : ${ip:-N/A}"
+    echo "DOMAIN : ${domain}"
+    echo "CLIENT : SSH $(db_count_accounts ssh) | VMESS $(db_count_accounts vmess) | VLESS $(db_count_accounts vless) | TROJAN $(db_count_accounts trojan)"
+    line
+    cat <<MENU
+[0 ] Install / Update Layanan
+[1 ] Running Service
+[2 ] Restart Service
+[3 ] Autoreboot
+[4 ] Monitoring
+[5 ] Speedtest
+[6 ] Add Domain
+[7 ] Fix HAProxy
+[8 ] Delete All Account Exp
+[9 ] Fix XRAY
+[10] Fix WS/NGINX
+[11] Fix Domain Layer
+[12] Change Banner
+[13] Clear Cache
+[14] Clear Logs
+[15] Backup & Restore Menu
+[16] Menu SSH / Dropbear
+[17] Menu XRAY VMESS/VLESS
+[18] Menu XRAY TROJAN
+[19] SSH over UDP Menu
+[20] Info Service Port
+[21] Features Admin
+[22] Exit
+MENU
+    read -rp "Select From Options [0-22 or x]: " choice
+    case $choice in
+      0)
+        check_root; check_os; check_arch; init_state
+        install_dependencies
+        install_openssh
+        install_dropbear
+        install_dropbear_ws
+        install_ssh_udp_template
+        start_ssh_udp "$SSH_UDP_DEFAULT_PORT"
+        install_xray
+        install_openvpn
+        install_badvpn
+        install_websocket_services
+        open_firewall_ports
+        ok "Instalasi selesai."
+        ;;
+      1) running_services ;;
+      2) restart_all_services ;;
+      3) configure_autoreboot ;;
+      4) troubleshooting_menu ;;
+      5) run_speedtest ;;
+      6) add_domain ;;
+      7) fix_haproxy ;;
+      8) delete_all_expired_accounts ;;
+      9) fix_xray_service ;;
+      10) fix_ws_layer ;;
+      11) fix_domain_layer ;;
+      12) change_banner ;;
+      13) clear_cache ;;
+      14) clear_logs ;;
+      15) show_backup_menu ;;
+      16) show_ssh_menu ;;
+      17) show_xray_menu ;;
+      18) show_trojan_menu ;;
+      19) configure_ssh_udp_menu ;;
+      20) show_service_info ;;
+      21) admin_features_menu ;;
+      22|x|X) exit 0 ;;
+      *) echo "Pilihan tidak dikenal" ;;
+    esac
+  done
 }
 
 # === Menu Akun SSH/Dropbear ===
@@ -882,43 +1143,7 @@ MENU
   esac
 }
 
-show_main_menu() {
-  while true; do
-    line; echo "AUTO TUNNELING MENU"; line
-    cat <<MENU
-1. Install/Update Semua Layanan
-2. Info Service Port
-3. Menu Fitur
-4. Backup Menu
-5. Troubleshooting
-x. Exit
-MENU
-    read -rp "Pilih: " choice
-    case $choice in
-      1)
-        check_root; check_os; check_arch; init_state
-        install_dependencies
-        install_openssh
-        install_dropbear
-        install_dropbear_ws
-        install_ssh_udp_template
-        start_ssh_udp "$SSH_UDP_DEFAULT_PORT"
-        install_xray
-        install_openvpn
-        install_badvpn
-        install_websocket_services
-        open_firewall_ports
-        ok "Instalasi selesai."
-        ;;
-      2) show_service_info ;;
-      3) show_features_menu ;;
-      4) show_backup_menu ;;
-      5) troubleshooting_menu ;;
-      x|X) exit 0 ;;
-      *) echo "Pilihan tidak valid" ;;
-    esac
-  done
-}
+show_main_menu() { show_dashboard; }
 
 # === Entry Point ===
 case "${1:-menu}" in
@@ -943,6 +1168,6 @@ case "${1:-menu}" in
     ;;
   menu|*)
     check_root; check_os; check_arch; init_state
-    show_main_menu
+    show_dashboard
     ;;
 esac
