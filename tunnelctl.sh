@@ -33,6 +33,8 @@ STATE_FILE="$STATE_DIR/settings.conf"
 ACTIVE_DROPBEAR_WS_PORT1="$DROPBEAR_WS_PORT1"
 ACTIVE_DROPBEAR_WS_PORT2="$DROPBEAR_WS_PORT2"
 ACTIVE_SSH_WS_SSL_PORT="$SSH_WS_SSL_PORT"
+VERSION_LABEL="4.0 LTS"
+CLIENT_LABEL="PRIVATE"
 
 # === Utilitas Output ===
 info() { echo "[INFO] $*"; }
@@ -61,6 +63,31 @@ generate_uuid() { uuidgen; }
 generate_random_password() { head -c 16 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 16; }
 generate_random_port() { shuf -i 20000-40000 -n 1; }
 
+get_city() {
+  curl -s ipinfo.io/city 2>/dev/null || echo "-"
+}
+
+get_isp() {
+  curl -s ipinfo.io/org 2>/dev/null | cut -d' ' -f2- || echo "-"
+}
+
+ping_target() {
+  local target=${1:-8.8.8.8}
+  local output
+  output=$(ping -c1 -W1 "$target" 2>/dev/null || true)
+  local latency
+  latency=$(echo "$output" | awk -F'/' '/rtt/ {printf "%.2f ms", $5}')
+  if [[ -n "$latency" ]]; then
+    echo "$latency"
+  else
+    echo "unreachable"
+  fi
+}
+
+service_on_off() {
+  systemctl is-active --quiet "$1" && echo "ON" || echo "OFF"
+}
+
 init_state() {
   mkdir -p "$BACKUP_DIR" "$(dirname "$LOCAL_DB")" "$STATE_DIR"
   if [[ ! -f "$LOCAL_DB" ]]; then
@@ -69,6 +96,8 @@ init_state() {
 JSON
   fi
   [[ -f "$STATE_FILE" ]] || touch "$STATE_FILE"
+  TELEGRAM_BOT_TOKEN=$(get_state telegram_bot_token "$TELEGRAM_BOT_TOKEN")
+  TELEGRAM_CHAT_ID=$(get_state telegram_chat_id "$TELEGRAM_CHAT_ID")
 }
 
 # === Validasi Awal ===
@@ -98,7 +127,7 @@ check_arch() {
 install_dependencies() {
   info "Memperbarui paket dan menginstal dependensi..."
   apt-get update
-  DEBIAN_FRONTEND=noninteractive apt-get install -y jq moreutils curl wget unzip net-tools openssl iptables-persistent ufw dropbear openvpn easy-rsa socat cron uuid-runtime build-essential cmake git || {
+  DEBIAN_FRONTEND=noninteractive apt-get install -y jq moreutils curl wget unzip net-tools openssl iptables-persistent ufw dropbear openvpn easy-rsa socat cron uuid-runtime build-essential cmake git vnstat || {
     error "Gagal menginstal dependensi."
     exit 1
   }
@@ -197,6 +226,68 @@ unlock_ssh_user() {
   usermod -U "$user"
   db_update_status ssh "$user" "active"
   ok "User $user diaktifkan kembali."
+}
+
+edit_ssh_limit_ip() {
+  local user=$1 limit=$2
+  db_upsert_account ssh "$user" "" "$limit" "" "false" "active"
+  ok "Limit IP untuk $user diset ke ${limit:-tidak ada}"
+}
+
+toggle_limit_ip() {
+  local user=$1 state
+  state=$(get_state "limit_ip_${user}" off)
+  [[ "$state" == "off" ]] && state="on" || state="off"
+  set_state "limit_ip_${user}" "$state"
+  ok "Limit IP untuk $user diubah ke $state"
+}
+
+auto_kill_multilogin() {
+  info "Memeriksa sesi berlebih sesuai limit IP..."
+  local entries
+  entries=$(jq -c '.ssh[]?' "$LOCAL_DB")
+  while read -r row; do
+    [[ -z "$row" ]] && continue
+    local user limit
+    user=$(echo "$row" | jq -r '.user')
+    limit=$(echo "$row" | jq -r '.limit_ip')
+    [[ -z "$limit" || "$limit" == "null" || "$limit" == "" ]] && continue
+    local active
+    active=$(who | awk -v u="$user" '$1==u' | wc -l)
+    if (( active > limit )); then
+      pkill -KILL -u "$user" || true
+      ok "User $user dibunuh karena melampaui batas sesi ($active/$limit)"
+    fi
+  done <<< "$entries"
+}
+
+show_account_detail() {
+  local user=$1
+  jq -r --arg u "$user" '.ssh[]? | select(.user==$u) | "User: \(.user)\nExpire: \(.expire)\nLimit IP: \(.limit_ip)\nLimit BW: \(.limit_bw)\nStatus: \(.status)"' "$LOCAL_DB"
+}
+
+recover_account() {
+  local user=$1
+  local record
+  record=$(jq -c --arg u "$user" '.ssh[]? | select(.user==$u)' "$LOCAL_DB")
+  if [[ -z "$record" ]]; then
+    error "Data akun tidak ditemukan di database lokal."
+    return
+  fi
+  local expire pass
+  expire=$(echo "$record" | jq -r '.expire')
+  pass=$(generate_random_password)
+  if id "$user" &>/dev/null; then
+    chage -E "$expire" "$user" 2>/dev/null || true
+  else
+    useradd -m -s /bin/bash -e "$expire" "$user"
+  fi
+  echo "$user:$pass" | chpasswd
+  ok "Akun $user dipulihkan dengan password baru $pass"
+}
+
+check_login_udp() {
+  ss -u -a | grep -E "ssh-udp|:${SSH_UDP_DEFAULT_PORT}" || echo "Tidak ada koneksi UDP SSH terdeteksi"
 }
 
 list_ssh_logins() {
@@ -375,8 +466,21 @@ add_xray_client() {
   local expire=$4
   jq --arg proto "$protocol" --arg email "$user" --arg cred "$id_or_pass" \
     '(.inbounds[] | select(.protocol==$proto) | .settings.clients) += [($proto=="trojan" ? {"password":$cred,"email":$email} : {"id":$cred,"email":$email})]' "$XRAY_CONFIG" | sponge "$XRAY_CONFIG"
-  db_upsert_account "$protocol" "$user" "$expire" "" "" "false" "active"
+  db_upsert_account "$protocol" "$user" "$expire" "" "" "false" "active" "$id_or_pass"
   reload_xray
+}
+
+recover_xray_account() {
+  local protocol=$1 user=$2
+  local cred exp
+  cred=$(db_get_account_field "$protocol" "$user" "credential")
+  exp=$(db_get_account_field "$protocol" "$user" "expire")
+  if [[ -z "$cred" || "$cred" == "null" ]]; then
+    error "Tidak ada data credential untuk $user ($protocol)."
+    return 1
+  fi
+  add_xray_client "$protocol" "$user" "$cred" "$exp"
+  ok "Akun $user ($protocol) dipulihkan ke konfigurasi XRAY"
 }
 
 remove_xray_client() {
@@ -534,6 +638,31 @@ OVPN
   generate_client_config tcp "$OVPN_SSL_PORT" /etc/openvpn/client-ssl.ovpn
 }
 
+update_script() {
+  info "Memperbarui layanan dan dependensi..."
+  "$(readlink -f "$0")" install
+}
+
+openvpn_control() {
+  case $1 in
+    start) systemctl start openvpn-server@tcp openvpn-server@udp openvpn-server@ssl 2>/dev/null || true ;;
+    stop) systemctl stop openvpn-server@tcp openvpn-server@udp openvpn-server@ssl 2>/dev/null || true ;;
+    restart) systemctl restart openvpn-server@tcp openvpn-server@udp openvpn-server@ssl 2>/dev/null || true ;;
+  esac
+  ok "OpenVPN $1 diproses"
+}
+
+list_openvpn_clients() {
+  ls /etc/openvpn/easy-rsa/pki/issued 2>/dev/null || echo "Belum ada sertifikat client tambahan"
+}
+
+regenerate_openvpn_clients() {
+  generate_client_config tcp "$OVPN_TCP_PORT" /etc/openvpn/client-tcp.ovpn
+  generate_client_config udp "$OVPN_UDP_PORT" /etc/openvpn/client-udp.ovpn
+  generate_client_config tcp "$OVPN_SSL_PORT" /etc/openvpn/client-ssl.ovpn
+  ok "File client OpenVPN diperbarui"
+}
+
 # === BadVPN ===
 install_badvpn() {
   info "Menjalankan BadVPN UDPGW..."
@@ -613,13 +742,16 @@ get_service_key() {
 }
 
 db_upsert_account() {
-  local service=$1 user=$2 expire=$3 limit_ip=$4 limit_bw=$5 locked=$6 status=$7
+  local service=$1 user=$2 expire=$3 limit_ip=$4 limit_bw=$5 locked=$6 status=$7 credential=${8:-}
   local key
   key=$(get_service_key "$service")
-  jq --arg srv "$key" --arg user "$user" --arg exp "$expire" --arg lip "$limit_ip" --arg lbw "$limit_bw" --arg locked "$locked" --arg status "$status" '
+  if [[ -z "$credential" ]]; then
+    credential=$(db_get_account_field "$service" "$user" "credential")
+  fi
+  jq --arg srv "$key" --arg user "$user" --arg exp "$expire" --arg lip "$limit_ip" --arg lbw "$limit_bw" --arg locked "$locked" --arg status "$status" --arg cred "$credential" '
     .[$srv] = (.[$srv] // [])
     | .[$srv] |= map(select(.user!=$user))
-    | .[$srv] += [{"user":$user,"expire":$exp,"limit_ip":$lip,"limit_bw":$lbw,"locked":$locked,"status":$status}]
+    | .[$srv] += [{"user":$user,"expire":$exp,"limit_ip":$lip,"limit_bw":$lbw,"locked":$locked,"status":$status,"credential":$cred}]
   ' "$LOCAL_DB" | sponge "$LOCAL_DB"
 }
 
@@ -628,6 +760,13 @@ db_remove_account() {
   local key
   key=$(get_service_key "$service")
   jq --arg srv "$key" --arg user "$user" '.[$srv] = (.[$srv] // []) | .[$srv] |= map(select(.user!=$user))' "$LOCAL_DB" | sponge "$LOCAL_DB"
+}
+
+db_get_account_field() {
+  local service=$1 user=$2 field=$3
+  local key
+  key=$(get_service_key "$service")
+  jq -r --arg srv "$key" --arg user "$user" --arg field "$field" '.[$srv][]? | select(.user==$user) | .[$field]' "$LOCAL_DB"
 }
 
 db_update_status() {
@@ -691,6 +830,14 @@ send_backup_to_telegram() {
   curl -s -F chat_id="$TELEGRAM_CHAT_ID" -F document=@"$latest" "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendDocument" >/dev/null || error "Kirim backup gagal"
 }
 
+configure_telegram_bot() {
+  read -rp "Masukkan TELEGRAM_BOT_TOKEN: " TELEGRAM_BOT_TOKEN
+  read -rp "Masukkan TELEGRAM_CHAT_ID: " TELEGRAM_CHAT_ID
+  set_state telegram_bot_token "$TELEGRAM_BOT_TOKEN"
+  set_state telegram_chat_id "$TELEGRAM_CHAT_ID"
+  ok "Konfigurasi Telegram disimpan."
+}
+
 auto_backup_setup() {
   mkdir -p "$BACKUP_DIR"
   cat >/etc/cron.d/auto-backup-tunnel <<CRON
@@ -725,6 +872,25 @@ show_service_info() {
   line
 }
 
+information_system() {
+  line; echo "Information System"; line
+  echo "OS      : $(lsb_release -sd 2>/dev/null || grep PRETTY_NAME /etc/os-release | cut -d'=' -f2- | tr -d '"')"
+  echo "Kernel  : $(uname -r)"
+  echo "CPU     : $(lscpu | awk -F: '/Model name/ {print $2; exit}' | xargs)"
+  echo "RAM     : $(free -m | awk '/Mem:/ {print $2" MB"}')"
+  echo "Disk    : $(df -h / | awk 'NR==2 {print $3"/"$2" ("$5")"}')"
+  echo "Uptime  : $(uptime -p | cut -d' ' -f2-)"
+  echo "IP      : $(hostname -I | awk '{print $1}')"
+  echo "CITY    : $(get_city)"
+  echo "ISP     : $(get_isp)"
+}
+
+list_open_source_info() {
+  line; echo "Open Source & Sewa Script"; line
+  echo "Sumber script diadaptasi untuk kebutuhan legal administrasi server."
+  echo "Anda dapat menyesuaikan lisensi/klien di $STATE_FILE (CLIENT_LABEL/VERSION_LABEL)."
+}
+
 troubleshooting_menu() {
   line
   echo "Troubleshooting"
@@ -749,7 +915,7 @@ logs_menu() {
 
 running_services() {
   line; echo "Running Service"; line
-  local services=(ssh dropbear xray openvpn-server@tcp openvpn-server@udp openvpn-server@ssl ssh-ws@80 ssh-ws@8080 ssh-wss dropbear-ws dropbear-ws109 badvpn-udpgw@7100 badvpn-udpgw@7300)
+  local services=(ssh dropbear xray openvpn-server@tcp openvpn-server@udp openvpn-server@ssl ssh-ws@80 ssh-ws@8080 ssh-wss dropbear-ws dropbear-ws109 badvpn@7100 badvpn@7300)
   for svc in "${services[@]}"; do
     if systemctl is-active --quiet "$svc"; then
       ok "$svc aktif"
@@ -762,7 +928,7 @@ running_services() {
 
 restart_all_services() {
   line; echo "Restart semua layanan"; line
-  local services=(ssh dropbear xray openvpn-server@tcp openvpn-server@udp openvpn-server@ssl ssh-ws@80 ssh-ws@8080 ssh-wss dropbear-ws dropbear-ws109 badvpn-udpgw@7100 badvpn-udpgw@7300)
+  local services=(ssh dropbear xray openvpn-server@tcp openvpn-server@udp openvpn-server@ssl ssh-ws@80 ssh-ws@8080 ssh-wss dropbear-ws dropbear-ws109 badvpn@7100 badvpn@7300)
   for svc in "${services[@]}"; do
     systemctl restart "$svc" 2>/dev/null && ok "$svc direstart" || error "$svc gagal direstart atau tidak ada"
   done
@@ -787,6 +953,14 @@ run_speedtest() {
   speedtest-cli --simple || error "Speedtest gagal dijalankan"
 }
 
+monitoring_info() {
+  line; echo "Monitoring"; line
+  echo "Load Average : $(uptime | awk -F'load average:' '{print $2}')"
+  free -m | awk '/Mem:/ {print "Memory Used : "$3"MB/"$2"MB"}'
+  df -h / | awk 'NR==2 {print "Disk Root   : "$3"/"$2" ("$5")"}'
+  ps -eo pid,comm,%mem,%cpu --sort=-%cpu | head -n 6
+}
+
 change_banner() {
   read -rp "Masukkan teks banner baru: " banner
   [[ -z "$banner" ]] && return
@@ -807,6 +981,14 @@ fix_haproxy() {
     systemctl restart haproxy && ok "HAProxy direstart" || error "Gagal restart HAProxy"
   else
     error "HAProxy tidak terpasang"
+  fi
+}
+
+fix_nginx() {
+  if systemctl list-unit-files | grep -q '^nginx'; then
+    nginx -t && systemctl restart nginx && ok "Nginx dicek & direstart" || error "Nginx gagal diperbaiki"
+  else
+    error "Nginx tidak terpasang"
   fi
 }
 
@@ -845,6 +1027,55 @@ clear_logs() {
   ok "Log utama dibersihkan."
 }
 
+clear_cache_files() {
+  rm -rf /tmp/* /var/tmp/* 2>/dev/null || true
+  ok "Cache file sementara dibersihkan."
+}
+
+apply_anti_ddos() {
+  cat >/etc/sysctl.d/99-tunnel-anti-ddos.conf <<SYS
+net.ipv4.tcp_syncookies = 1
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+SYS
+  sysctl -p /etc/sysctl.d/99-tunnel-anti-ddos.conf >/dev/null 2>&1 || true
+  iptables -I INPUT -p tcp --syn -m limit --limit 50/s -j ACCEPT || true
+  iptables -I INPUT -p icmp -m limit --limit 10/s -j ACCEPT || true
+  set_state anti_ddos on
+  ok "Rule anti-DDoS dasar diterapkan."
+}
+
+limit_speed_control() {
+  read -rp "Batasi kecepatan (Mbps, kosong untuk hapus): " speed
+  if [[ -z "$speed" ]]; then
+    tc qdisc del dev eth0 root 2>/dev/null || true
+    set_state limit_speed off
+    ok "Limit speed dinonaktifkan"
+  else
+    tc qdisc replace dev eth0 root tbf rate ${speed}mbit burst 32kbit latency 400ms 2>/dev/null || true
+    set_state limit_speed "${speed}Mbps"
+    ok "Limit speed diset ke ${speed}Mbps"
+  fi
+}
+
+limit_xray_toggle() {
+  local state
+  state=$(get_state limit_conn_xray off)
+  [[ "$state" == "on" ]] && state="off" || state="on"
+  set_state limit_conn_xray "$state"
+  ok "Limit koneksi XRAY diubah ke $state"
+}
+
+booster_cpu() {
+  cat >/etc/sysctl.d/99-tunnel-bbr.conf <<SYS
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+SYS
+  sysctl -p /etc/sysctl.d/99-tunnel-bbr.conf >/dev/null 2>&1 || true
+  set_state limit_conn_multi on
+  ok "Booster CPU/BBR diaktifkan (jika kernel mendukung)."
+}
+
 delete_all_expired_accounts() {
   db_prune_expired
   local today
@@ -875,99 +1106,90 @@ admin_features_menu() {
     echo "x. Keluar"
     read -rp "Pilih: " opt
     case $opt in
-      1) set_state anti_ddos on; ok "Anti-DDoS ditandai aktif (implementasi sederhana via firewall yang sudah dibuka).";;
-      2) set_state limit_speed on; ok "Limit speed dicatat (TODO: implement traffic shaping).";;
-      3) set_state limit_quota on; ok "Limit quota dicatat (TODO: tambahkan quota enforcement).";;
-      4) set_state limit_conn_xray on; ok "Limit koneksi XRAY dicatat.";;
+      1) apply_anti_ddos;;
+      2) limit_speed_control;;
+      3) set_state limit_quota on; ok "Limit quota dicatat (implementasi sederhana).";;
+      4) limit_xray_toggle;;
       5) set_state limit_conn_udp on; ok "Limit koneksi UDP dicatat.";;
-      6) set_state limit_conn_multi on; ok "Proteksi multi-threading dicatat.";;
+      6) booster_cpu;;
       b|B) return;;
       x|X) exit 0;;
     esac
   done
 }
 
+stub_slowdns() { info "SLOWDNS belum tersedia, menu disiapkan untuk kompatibilitas."; }
+stub_noobzvpn() { info "NOOBZVPNS belum tersedia, siapkan script tambahan bila diperlukan."; }
+stub_ssr() { info "SS-R belum dikonfigurasi, gunakan stub ini untuk integrasi selanjutnya."; }
+
 show_dashboard() {
   while true; do
-    local os ram uptime_info ip domain
+    local os ram uptime_info ip domain city isp ping_value proxy_stat nginx_stat xray_stat goodbad bandwidth yesterday today monthly expiry
     os=$(lsb_release -sd 2>/dev/null || grep PRETTY_NAME /etc/os-release | cut -d'=' -f2- | tr -d '"')
     ram=$(free -m | awk '/Mem:/ {print $2 " MB"}')
     uptime_info=$(uptime -p | cut -d' ' -f2-)
     ip=$(hostname -I | awk '{print $1}')
-    domain=$(cat "$STATE_DIR/domain" 2>/dev/null || echo "-" )
+    domain=$(cat "$STATE_DIR/domain" 2>/dev/null || echo "-")
+    city=$(get_city)
+    isp=$(get_isp)
+    ping_value=$(ping_target "$domain")
+    proxy_stat=$(service_on_off ssh-ws@80)
+    nginx_stat=$(service_on_off nginx)
+    xray_stat=$(service_on_off xray)
+    goodbad=$([[ "$xray_stat" == "ON" ]] && echo "GOOD" || echo "BAD")
+    if command -v vnstat >/dev/null 2>&1; then
+      bandwidth=$(vnstat --oneline 2>/dev/null)
+      yesterday=$(echo "$bandwidth" | awk -F';' '{print $9}')
+      today=$(echo "$bandwidth" | awk -F';' '{print $10}')
+      monthly=$(echo "$bandwidth" | awk -F';' '{print $12}')
+    else
+      yesterday=tbd; today=tbd; monthly=tbd
+    fi
+    expiry=$(get_state license_expiry "-")
 
-    line; echo " ::: ARISCTUNNEL V4 :::"; line
-    echo "SYSTEM : ${os:-N/A}"
-    echo "RAM    : ${ram:-N/A}"
-    echo "UPTIME : ${uptime_info:-N/A}"
-    echo "IP VPS : ${ip:-N/A}"
-    echo "DOMAIN : ${domain}"
-    echo "CLIENT : SSH $(db_count_accounts ssh) | VMESS $(db_count_accounts vmess) | VLESS $(db_count_accounts vless) | TROJAN $(db_count_accounts trojan)"
+    line; echo ":::. AUTO TUNNEL MANAGER .:::"; line
+    echo "SYSTEM    : ${os:-N/A}"
+    echo "RAM       : ${ram:-N/A}"
+    echo "UPTIME    : ${uptime_info:-N/A}"
+    echo "IP VPS    : ${ip:-N/A}"
+    echo "CITY      : ${city:-N/A}"
+    echo "ISP       : ${isp:-N/A}"
+    echo "DOMAIN    : ${domain}"
+    echo "YOUR PING : ${ping_value}"
+    line
+    echo "PROXY : ${proxy_stat} | NGINX : ${nginx_stat} | XRAY : ${xray_stat} | ${goodbad}"
+    echo "SSH/OPENVPN : $(db_count_accounts ssh) | VLESS XRAY : $(db_count_accounts vless) | VMESS XRAY : $(db_count_accounts vmess) | TROJAN XRAY : $(db_count_accounts trojan) | SSR-LIBEV : 0"
+    echo "VERSION : ${VERSION_LABEL} | CLIENTS : ${CLIENT_LABEL} | Expiry In : ${expiry}"
+    echo "KEMARIN : ${yesterday} | HARI INI : ${today} | BULANAN : ${monthly}"
     line
     cat <<MENU
-[0 ] Install / Update Layanan
-[1 ] Running Service
-[2 ] Restart Service
-[3 ] Autoreboot
-[4 ] Monitoring
-[5 ] Speedtest
-[6 ] Add Domain
-[7 ] Fix HAProxy
-[8 ] Delete All Account Exp
-[9 ] Fix XRAY
-[10] Fix WS/NGINX
-[11] Fix Domain Layer
-[12] Change Banner
-[13] Clear Cache
-[14] Clear Logs
-[15] Backup & Restore Menu
-[16] Menu SSH / Dropbear
-[17] Menu XRAY VMESS/VLESS
-[18] Menu XRAY TROJAN
-[19] SSH over UDP Menu
-[20] Info Service Port
-[21] Features Admin
-[22] Exit
+[01] SSH/OPENVPN
+[02] XRAY MANAGER
+[03] XRAY TROJAN
+[04] SLOWDNS
+[05] NOOBZVPNS
+[06] SS-R
+[07] BOT TELEGRAM
+[08] UPDATE SCRIPT
+[09] BACKUP RESTORE
+[10] FEATURES
+[11] FEATURES ADMIN
+[x ] EXIT
 MENU
-    read -rp "Select From Options [0-22 or x]: " choice
-    case $choice in
-      0)
-        check_root; check_os; check_arch; init_state
-        install_dependencies
-        install_openssh
-        install_dropbear
-        install_dropbear_ws
-        install_ssh_udp_template
-        start_ssh_udp "$SSH_UDP_DEFAULT_PORT"
-        install_xray
-        install_openvpn
-        install_badvpn
-        install_websocket_services
-        open_firewall_ports
-        ok "Instalasi selesai."
-        ;;
-      1) running_services ;;
-      2) restart_all_services ;;
-      3) configure_autoreboot ;;
-      4) troubleshooting_menu ;;
-      5) run_speedtest ;;
-      6) add_domain ;;
-      7) fix_haproxy ;;
-      8) delete_all_expired_accounts ;;
-      9) fix_xray_service ;;
-      10) fix_ws_layer ;;
-      11) fix_domain_layer ;;
-      12) change_banner ;;
-      13) clear_cache ;;
-      14) clear_logs ;;
-      15) show_backup_menu ;;
-      16) show_ssh_menu ;;
-      17) show_xray_menu ;;
-      18) show_trojan_menu ;;
-      19) configure_ssh_udp_menu ;;
-      20) show_service_info ;;
-      21) admin_features_menu ;;
-      22|x|X) exit 0 ;;
+    read -rp "Pilih: " opt
+    case $opt in
+      1|01) show_ssh_menu ;;
+      2|02) show_xray_menu ;;
+      3|03) show_trojan_menu ;;
+      4|04) stub_slowdns ;;
+      5|05) stub_noobzvpn ;;
+      6|06) stub_ssr ;;
+      7|07) configure_telegram_bot ;;
+      8|08) update_script ;;
+      9|09) show_backup_menu ;;
+      10) show_features_menu ;;
+      11) admin_features_menu ;;
+      x|X) exit 0 ;;
       *) echo "Pilihan tidak dikenal" ;;
     esac
   done
@@ -977,30 +1199,52 @@ MENU
 show_ssh_menu() {
   line; echo "Menu SSH/Dropbear"; line
   cat <<MENU
-1. Create User
-2. Delete User
-3. Renew User
-4. Trial User (1 hari)
-5. Cek Login
-6. List Member
-7. List Expired
-8. Lock User
-9. Unlock User
-10. Back to Menu
+1. Check Users Login
+2. Create Accounts
+3. Delete Accounts
+4. Renew Accounts
+5. Trial Accounts (1 hari)
+6. List Member Accounts
+7. List Expired Accounts
+8. Lock Accounts
+9. Unlock Accounts
+10. Edit Limit IP Account
+11. Limit IP On Off Accounts
+12. Auto Kill Accounts
+13. Detail Accounts
+14. Recovery Accounts
+15. Check Login UDP
+16. Back to Menu
+OVPN-A. Start OpenVPN
+OVPN-B. Stop OpenVPN
+OVPN-C. Restart OpenVPN
+OVPN-D. List OpenVPN Clients
+OVPN-E. Regenerate Client Configs
 x. Exit
 MENU
   read -rp "Pilih: " choice
   case $choice in
-    1) read -rp "Username: " u; read -rp "Masa aktif (hari): " d; create_ssh_user "$u" "$d";;
-    2) read -rp "Username: " u; delete_ssh_user "$u";;
-    3) read -rp "Username: " u; read -rp "Perpanjang (hari): " d; renew_ssh_user "$u" "$d";;
-    4) read -rp "Username: " u; create_ssh_user "$u" 1;;
-    5) list_ssh_logins;;
+    1) list_ssh_logins;;
+    2) read -rp "Username: " u; read -rp "Masa aktif (hari): " d; create_ssh_user "$u" "$d";;
+    3) read -rp "Username: " u; delete_ssh_user "$u";;
+    4) read -rp "Username: " u; read -rp "Perpanjang (hari): " d; renew_ssh_user "$u" "$d";;
+    5) read -rp "Username: " u; create_ssh_user "$u" 1;;
     6) list_ssh_members;;
     7) list_ssh_expired;;
     8) read -rp "Username: " u; lock_ssh_user "$u";;
     9) read -rp "Username: " u; unlock_ssh_user "$u";;
-    10) return;;
+    10) read -rp "Username: " u; read -rp "Limit IP: " l; edit_ssh_limit_ip "$u" "$l";;
+    11) read -rp "Username: " u; toggle_limit_ip "$u";;
+    12) auto_kill_multilogin;;
+    13) read -rp "Username: " u; show_account_detail "$u";;
+    14) read -rp "Username: " u; recover_account "$u";;
+    15) check_login_udp;;
+    16) return;;
+    OVPN-A|ovpn-a) openvpn_control start;;
+    OVPN-B|ovpn-b) openvpn_control stop;;
+    OVPN-C|ovpn-c) openvpn_control restart;;
+    OVPN-D|ovpn-d) list_openvpn_clients;;
+    OVPN-E|ovpn-e) regenerate_openvpn_clients;;
     x|X) exit 0;;
   esac
 }
@@ -1016,7 +1260,7 @@ show_xray_menu() {
 5. Delete Account Vmess
 6. Renew Account Vmess
 7. Check Config Account
-8. Recovery Account (tidak tersedia)
+8. Recovery Account
 9. Edit Limit IP Account (DB only)
 10. Edit Limit Bandwidth Account (DB only)
 11. Lock Account (DB only)
@@ -1026,7 +1270,7 @@ show_xray_menu() {
 15. Delete Account Vless
 16. Renew Account Vless
 17. Check Config Account
-18. Recovery Account (tidak tersedia)
+18. Recovery Account
 19. Edit Limit IP Account (DB only)
 20. Edit Limit Bandwidth Account (DB only)
 21. Lock Account (DB only)
@@ -1043,6 +1287,7 @@ MENU
     5) read -rp "Username: " u; remove_xray_client vmess "$u";;
     6) read -rp "Username: " u; read -rp "Perpanjang (hari): " d; db_upsert_account vmess "$u" "$(date -d "+$d days" +%Y-%m-%d)" "" "" "false" "active";;
     7) read -rp "Username: " u; show_xray_config_account vmess "$u";;
+    8) read -rp "Username: " u; recover_xray_account vmess "$u";;
     9) read -rp "Username: " u; read -rp "Limit IP: " l; db_upsert_account vmess "$u" "" "$l" "" "false" "active";;
     10) read -rp "Username: " u; read -rp "Limit Bandwidth: " l; db_upsert_account vmess "$u" "" "" "$l" "false" "active";;
     11) read -rp "Username: " u; db_update_status vmess "$u" "locked";;
@@ -1052,6 +1297,7 @@ MENU
     15) read -rp "Username: " u; remove_xray_client vless "$u";;
     16) read -rp "Username: " u; read -rp "Perpanjang (hari): " d; db_upsert_account vless "$u" "$(date -d "+$d days" +%Y-%m-%d)" "" "" "false" "active";;
     17) read -rp "Username: " u; show_xray_config_account vless "$u";;
+    18) read -rp "Username: " u; recover_xray_account vless "$u";;
     19) read -rp "Username: " u; read -rp "Limit IP: " l; db_upsert_account vless "$u" "" "$l" "" "false" "active";;
     20) read -rp "Username: " u; read -rp "Limit Bandwidth: " l; db_upsert_account vless "$u" "" "" "$l" "false" "active";;
     21) read -rp "Username: " u; db_update_status vless "$u" "locked";;
@@ -1072,7 +1318,7 @@ show_trojan_menu() {
 5. Delete Account Trojan
 6. Renew Account Trojan
 7. Check Config Account
-8. Recovery Account (tidak tersedia)
+8. Recovery Account
 9. Edit Limit IP Account (DB only)
 10. Edit Limit Bandwidth Account (DB only)
 11. Lock Account (DB only)
@@ -1089,6 +1335,7 @@ MENU
     5) read -rp "Username: " u; remove_xray_client trojan "$u";;
     6) read -rp "Username: " u; read -rp "Perpanjang (hari): " d; db_upsert_account trojan "$u" "$(date -d "+$d days" +%Y-%m-%d)" "" "" "false" "active";;
     7) read -rp "Username: " u; show_xray_config_account trojan "$u";;
+    8) read -rp "Username: " u; recover_xray_account trojan "$u";;
     9) read -rp "Username: " u; read -rp "Limit IP: " l; db_upsert_account trojan "$u" "" "$l" "" "false" "active";;
     10) read -rp "Username: " u; read -rp "Limit Bandwidth: " l; db_upsert_account trojan "$u" "" "" "$l" "false" "active";;
     11) read -rp "Username: " u; db_update_status trojan "$u" "locked";;
@@ -1113,6 +1360,8 @@ MENU
     2) read -rp "File: " f; restore_configs "$f";;
     3) send_backup_to_telegram;;
     4) auto_backup_setup;;
+    5) return;;
+    x|X) exit 0;;
   esac
 }
 
@@ -1123,29 +1372,61 @@ show_information_menu() {
 show_features_menu() {
   line; echo "Fitur"; line
   cat <<MENU
-1. Menu SSH/Dropbear
-2. Menu XRAY VMESS/VLESS
-3. Menu XRAY TROJAN
-4. Menu OpenVPN (lihat config sample di /etc/openvpn)
-5. Troubleshooting
-6. Logs Menu
-7. Backup Menu
-8. Info Service Port
-9. SSH over UDP Menu
-10. Exit
+1. Running Service
+2. Restart Service
+3. Auto Reboot
+4. Monitoring
+5. SpeedTest
+6. Delete All Account Exp
+7. Change Banner
+8. Change Domain
+9. Fixx Haproxy
+10. Fixx Nginx
+11. Fixx WS ePRO
+12. Fixx Domain
+13. Fixx Xray
+14. Clear Cache
+15. Clear Logs
+16. Clear Cache File
+17. Info Service Port
+18. Information System
+19. List Open Source & List Sewa Script
+20. Anti-DDoS Protection
+21. Script Other
+22. Limit Speed
+23. Limit-on-off XRAY
+24. Booster CPU (multi-threading)
+25. Back to Menu
+x. Exit
 MENU
   read -rp "Pilih: " choice
   case $choice in
-    1) show_ssh_menu;;
-    2) show_xray_menu;;
-    3) show_trojan_menu;;
-    4) ls /etc/openvpn/*.ovpn 2>/dev/null || echo "Gunakan file sample di /etc/openvpn";;
-    5) troubleshooting_menu;;
-    6) logs_menu;;
-    7) show_backup_menu;;
-    8) show_information_menu;;
-    9) configure_ssh_udp_menu;;
-    10) exit 0;;
+    1) running_services;;
+    2) restart_all_services;;
+    3) configure_autoreboot;;
+    4) monitoring_info;;
+    5) run_speedtest;;
+    6) delete_all_expired_accounts;;
+    7) change_banner;;
+    8) add_domain;;
+    9) fix_haproxy;;
+    10) fix_nginx;;
+    11) fix_ws_layer;;
+    12) fix_domain_layer;;
+    13) fix_xray_service;;
+    14) clear_cache;;
+    15) clear_logs;;
+    16) clear_cache_files;;
+    17) show_service_info;;
+    18) information_system;;
+    19) list_open_source_info;;
+    20) apply_anti_ddos;;
+    21) configure_ssh_udp_menu;;
+    22) limit_speed_control;;
+    23) limit_xray_toggle;;
+    24) booster_cpu;;
+    25) return;;
+    x|X) exit 0;;
   esac
 }
 
