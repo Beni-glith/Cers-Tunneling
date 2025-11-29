@@ -11,9 +11,7 @@ OPENSSH_PORT=22
 DROPBEAR_PORT1=143
 DROPBEAR_PORT2=109
 DROPBEAR_WS_PORT1=443
-DROPBEAR_WS_PORT1_FALLBACK=8443
 DROPBEAR_WS_PORT2=109
-DROPBEAR_WS_PORT2_FALLBACK=2095
 SSH_UDP_DEFAULT_PORT=5300
 OVPN_SSL_PORT=443
 OVPN_TCP_PORT=1194
@@ -21,7 +19,6 @@ OVPN_UDP_PORT=2200
 BADVPN_PORTS=(7100 7300)
 SSH_WS_PORTS=(80 8080)
 SSH_WS_SSL_PORT=443
-SSH_WS_SSL_PORT_FALLBACK=4443
 XRAY_VMESS_PORT=8443
 XRAY_VLESS_PORT=8444
 XRAY_TROJAN_PORT=8445
@@ -400,8 +397,8 @@ install_dropbear() {
 install_dropbear_ws() {
   info "Menyiapkan WebSocket untuk Dropbear..."
   local ws1 ws2
-  ws1=$(ensure_port_available "$DROPBEAR_WS_PORT1" tcp "$DROPBEAR_WS_PORT1_FALLBACK") || return 1
-  ws2=$(ensure_port_available "$DROPBEAR_WS_PORT2" tcp "$DROPBEAR_WS_PORT2_FALLBACK") || return 1
+  ws1=$(ensure_port_available "$DROPBEAR_WS_PORT1" tcp) || return 1
+  ws2=$(ensure_port_available "$DROPBEAR_WS_PORT2" tcp) || return 1
   ACTIVE_DROPBEAR_WS_PORT1="$ws1"
   ACTIVE_DROPBEAR_WS_PORT2="$ws2"
   cat >/etc/systemd/system/dropbear-ws.service <<WS
@@ -772,7 +769,7 @@ BAD
 install_websocket_services() {
   info "Menyiapkan SSH WebSocket..."
   local wss_port
-  wss_port=$(ensure_port_available "$SSH_WS_SSL_PORT" tcp "$SSH_WS_SSL_PORT_FALLBACK") || return 1
+  wss_port=$(ensure_port_available "$SSH_WS_SSL_PORT" tcp) || return 1
   ACTIVE_SSH_WS_SSL_PORT="$wss_port"
   for port in "${SSH_WS_PORTS[@]}"; do
     cat >/etc/systemd/system/ssh-ws@$port.service <<WSS
