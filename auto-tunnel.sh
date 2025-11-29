@@ -13,6 +13,7 @@ STATE_DIR="/etc/tunneling"
 STATE_FILE="$STATE_DIR/settings.conf"
 PERMISSION_FLAG_FILE="$STATE_DIR/.permission_granted"
 IP_ALLOWLIST_FILE="$STATE_DIR/allowed_ips"
+ALLOWLIST_TEMPLATE="$SOURCE_DIR/allowed_ips.conf"
 BACKUP_CRON="/etc/cron.d/auto-backup-tunnel"
 
 info() { echo "[INFO] $*"; }
@@ -74,20 +75,37 @@ detect_public_ip() {
 
 configure_ip_allowlist() {
   mkdir -p "$STATE_DIR"
-  local current_ip ip_list
+  local from_template=false
+  if [[ -s "$ALLOWLIST_TEMPLATE" ]]; then
+    info "Menyalin daftar izin IP dari template $ALLOWLIST_TEMPLATE."
+    install -m 0600 "$ALLOWLIST_TEMPLATE" "$IP_ALLOWLIST_FILE"
+    from_template=true
+  else
+    : >"$IP_ALLOWLIST_FILE"
+  fi
+
+  local current_ip ip_list existing_count
   current_ip=$(detect_public_ip)
-  info "IP publik terdeteksi: ${current_ip:-tidak terdeteksi}"
-  read -rp "Daftar IP yang diizinkan (pisahkan dengan spasi) [default: ${current_ip:-wajib isi}]: " ip_list
-  if [[ -z "$ip_list" && -n "$current_ip" ]]; then
-    ip_list="$current_ip"
+  existing_count=$(grep -Evc '^(#|\s*$)' "$IP_ALLOWLIST_FILE")
+  if [[ "$existing_count" -eq 0 ]]; then
+    info "IP publik terdeteksi: ${current_ip:-tidak terdeteksi}"
+    read -rp "Daftar IP yang diizinkan (pisahkan dengan spasi) [default: ${current_ip:-wajib isi}]: " ip_list
+    if [[ -z "$ip_list" && -n "$current_ip" ]]; then
+      ip_list="$current_ip"
+    fi
+    if [[ -z "$ip_list" ]]; then
+      error "Minimal satu IP harus dicantumkan dalam daftar izin."
+      exit 1
+    fi
+    tr ' ' '\n' <<<"$ip_list" | sed '/^$/d' | sort -u >>"$IP_ALLOWLIST_FILE"
   fi
-  if [[ -z "$ip_list" ]]; then
-    error "Minimal satu IP harus dicantumkan dalam daftar izin."
-    exit 1
-  fi
-  tr ' ' '\n' <<<"$ip_list" | sed '/^$/d' | sort -u >"$IP_ALLOWLIST_FILE"
+
   chmod 600 "$IP_ALLOWLIST_FILE"
-  ok "Daftar izin IP disimpan di $IP_ALLOWLIST_FILE."
+  if $from_template; then
+    ok "Daftar izin IP diimpor dari template dan disimpan di $IP_ALLOWLIST_FILE. Edit file ini untuk menambah atau mencabut izin."
+  else
+    ok "Daftar izin IP disimpan di $IP_ALLOWLIST_FILE. Edit file ini untuk menambah atau mencabut izin."
+  fi
 }
 
 configure_telegram() {
