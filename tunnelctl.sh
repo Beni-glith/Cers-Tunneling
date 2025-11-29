@@ -113,7 +113,13 @@ install_dependencies() {
 
 # === Firewall ===
 open_firewall_ports() {
-  local ports=("$OPENSSH_PORT" "$DROPBEAR_PORT1" "$DROPBEAR_PORT2" "$ACTIVE_DROPBEAR_WS_PORT1" "$ACTIVE_DROPBEAR_WS_PORT2" "$OVPN_SSL_PORT" "$OVPN_TCP_PORT" "$OVPN_UDP_PORT" "${BADVPN_PORTS[@]}" "${SSH_WS_PORTS[@]}" "$ACTIVE_SSH_WS_SSL_PORT")
+  local ports=(
+    "$OPENSSH_PORT" "$DROPBEAR_PORT1" "$DROPBEAR_PORT2"
+    "$ACTIVE_DROPBEAR_WS_PORT1" "$ACTIVE_DROPBEAR_WS_PORT2"
+    "$OVPN_SSL_PORT" "$OVPN_TCP_PORT" "$OVPN_UDP_PORT"
+    "${BADVPN_PORTS[@]}" "${SSH_WS_PORTS[@]}" "$ACTIVE_SSH_WS_SSL_PORT"
+    8443 8444 8445
+  )
   for p in "${ports[@]}"; do
     ufw allow "$p" >/dev/null 2>&1 || true
     iptables -I INPUT -p tcp --dport "$p" -j ACCEPT || true
