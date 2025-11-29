@@ -13,7 +13,8 @@ DROPBEAR_PORT2=109
 DROPBEAR_WS_PORT1=443
 DROPBEAR_WS_PORT1_FALLBACK=8443
 DROPBEAR_WS_PORT2=109
-SSH_UDP_DEFAULT_PORT=7300
+DROPBEAR_WS_PORT2_FALLBACK=2095
+SSH_UDP_DEFAULT_PORT=5300
 OVPN_SSL_PORT=443
 OVPN_TCP_PORT=1194
 OVPN_UDP_PORT=2200
@@ -21,6 +22,9 @@ BADVPN_PORTS=(7100 7300)
 SSH_WS_PORTS=(80 8080)
 SSH_WS_SSL_PORT=443
 SSH_WS_SSL_PORT_FALLBACK=4443
+XRAY_VMESS_PORT=8443
+XRAY_VLESS_PORT=8444
+XRAY_TROJAN_PORT=8445
 XRAY_CONFIG="/usr/local/etc/xray/config.json"
 TELEGRAM_BOT_TOKEN=""
 TELEGRAM_CHAT_ID=""
@@ -147,7 +151,7 @@ open_firewall_ports() {
     "$ACTIVE_DROPBEAR_WS_PORT1" "$ACTIVE_DROPBEAR_WS_PORT2"
     "$OVPN_SSL_PORT" "$OVPN_TCP_PORT" "$OVPN_UDP_PORT"
     "${BADVPN_PORTS[@]}" "${SSH_WS_PORTS[@]}" "$ACTIVE_SSH_WS_SSL_PORT"
-    8443 8444 8445
+    "$XRAY_VMESS_PORT" "$XRAY_VLESS_PORT" "$XRAY_TROJAN_PORT"
   )
   for p in "${ports[@]}"; do
     ufw allow "$p" >/dev/null 2>&1 || true
@@ -330,7 +334,7 @@ install_dropbear_ws() {
   info "Menyiapkan WebSocket untuk Dropbear..."
   local ws1 ws2
   ws1=$(ensure_port_available "$DROPBEAR_WS_PORT1" tcp "$DROPBEAR_WS_PORT1_FALLBACK") || return 1
-  ws2=$(ensure_port_available "$DROPBEAR_WS_PORT2" tcp) || return 1
+  ws2=$(ensure_port_available "$DROPBEAR_WS_PORT2" tcp "$DROPBEAR_WS_PORT2_FALLBACK") || return 1
   ACTIVE_DROPBEAR_WS_PORT1="$ws1"
   ACTIVE_DROPBEAR_WS_PORT2="$ws2"
   cat >/etc/systemd/system/dropbear-ws.service <<WS
@@ -381,10 +385,12 @@ UDP
 
 start_ssh_udp() {
   local port=$1
-  echo "$port" >>"$SSH_UDP_STATE_FILE"
-  systemctl enable ssh-udp@"$port"
-  systemctl restart ssh-udp@"$port"
-  ok "SSH over UDP aktif di port $port"
+  local chosen
+  chosen=$(ensure_port_available "$port" udp) || return 1
+  echo "$chosen" >>"$SSH_UDP_STATE_FILE"
+  systemctl enable ssh-udp@"$chosen"
+  systemctl restart ssh-udp@"$chosen"
+  ok "SSH over UDP aktif di port $chosen"
 }
 
 configure_ssh_udp_menu() {
@@ -430,21 +436,21 @@ install_xray() {
   },
   "inbounds": [
     {
-      "port": 8443,
+      "port": ${XRAY_VMESS_PORT},
       "protocol": "vmess",
       "tag": "vmess-ws",
       "settings": {"clients": []},
       "streamSettings": {"network": "ws", "wsSettings": {"path": "/vmess"}}
     },
     {
-      "port": 8444,
+      "port": ${XRAY_VLESS_PORT},
       "protocol": "vless",
       "tag": "vless-ws",
       "settings": {"clients": [], "decryption": "none"},
       "streamSettings": {"network": "ws", "wsSettings": {"path": "/vless"}}
     },
     {
-      "port": 8445,
+      "port": ${XRAY_TROJAN_PORT},
       "protocol": "trojan",
       "tag": "trojan-tcp",
       "settings": {"clients": []}
@@ -504,7 +510,7 @@ show_xray_config_account() {
   "v": "2",
   "ps": "$user",
   "add": "$(curl -s ifconfig.me || echo your-server)",
-  "port": 8443,
+  "port": ${XRAY_VMESS_PORT},
   "id": "$id",
   "aid": "0",
   "net": "ws",
@@ -521,13 +527,13 @@ CFG
       local id
       id=$(jq -r --arg email "$user" '.inbounds[] | select(.protocol=="vless") | .settings.clients[] | select(.email==$email) | .id' "$XRAY_CONFIG")
       [[ -z "$id" ]] && { error "User tidak ditemukan"; return; }
-      echo "URL VLESS: vless://$id@$(curl -s ifconfig.me || echo your-server):8444?encryption=none&security=none&type=ws&path=/vless#${user}"
+      echo "URL VLESS: vless://$id@$(curl -s ifconfig.me || echo your-server):${XRAY_VLESS_PORT}?encryption=none&security=none&type=ws&path=/vless#${user}"
       ;;
     trojan)
       local pwd
       pwd=$(jq -r --arg email "$user" '.inbounds[] | select(.protocol=="trojan") | .settings.clients[] | select(.email==$email) | .password' "$XRAY_CONFIG")
       [[ -z "$pwd" ]] && { error "User tidak ditemukan"; return; }
-      echo "URL TROJAN: trojan://$pwd@$(curl -s ifconfig.me || echo your-server):8445#${user}"
+      echo "URL TROJAN: trojan://$pwd@$(curl -s ifconfig.me || echo your-server):${XRAY_TROJAN_PORT}#${user}"
       ;;
   esac
 }
@@ -866,9 +872,9 @@ show_service_info() {
   echo "BadVPN UDPGW   : ${BADVPN_PORTS[*]}"
   echo "SSH WS         : ${SSH_WS_PORTS[*]}"
   echo "SSH WS SSL     : $ACTIVE_SSH_WS_SSL_PORT"
-  echo "XRAY (VMESS)   : 8443"
-  echo "XRAY (VLESS)   : 8444"
-  echo "XRAY (TROJAN)  : 8445"
+  echo "XRAY (VMESS)   : $XRAY_VMESS_PORT"
+  echo "XRAY (VLESS)   : $XRAY_VLESS_PORT"
+  echo "XRAY (TROJAN)  : $XRAY_TROJAN_PORT"
   line
 }
 
