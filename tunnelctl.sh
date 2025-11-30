@@ -137,6 +137,7 @@ install_dependencies() {
     error "Gagal menginstal dependensi."
     exit 1
   }
+  ensure_badvpn_binary
   if ! command -v xray >/dev/null 2>&1; then
     info "Xray tidak ditemukan, memasang via installer resmi..."
     bash <(curl -Ls https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh) install || {
@@ -734,17 +735,23 @@ regenerate_openvpn_clients() {
 }
 
 # === BadVPN ===
+ensure_badvpn_binary() {
+  if command -v badvpn-udpgw >/dev/null 2>&1; then
+    return
+  fi
+
+  info "Binary badvpn-udpgw tidak ditemukan, mengompilasi dari sumber..."
+  tmpdir=$(mktemp -d)
+  git clone --depth=1 https://github.com/ambrop72/badvpn.git "$tmpdir" >/dev/null 2>&1
+  cmake -S "$tmpdir" -B "$tmpdir/build" -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1 >/dev/null
+  cmake --build "$tmpdir/build" >/dev/null
+  install -m 0755 "$tmpdir/build/udpgw/badvpn-udpgw" /usr/local/bin/badvpn-udpgw
+  rm -rf "$tmpdir"
+}
+
 install_badvpn() {
   info "Menjalankan BadVPN UDPGW..."
-  if ! command -v badvpn-udpgw >/dev/null 2>&1; then
-    info "Binary badvpn-udpgw tidak ditemukan, mengompilasi dari sumber..."
-    tmpdir=$(mktemp -d)
-    git clone --depth=1 https://github.com/ambrop72/badvpn.git "$tmpdir" >/dev/null 2>&1
-    cmake -S "$tmpdir" -B "$tmpdir/build" -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1 >/dev/null
-    cmake --build "$tmpdir/build" >/dev/null
-    install -m 0755 "$tmpdir/build/udpgw/badvpn-udpgw" /usr/local/bin/badvpn-udpgw
-    rm -rf "$tmpdir"
-  fi
+  ensure_badvpn_binary
   local badvpn_bin
   badvpn_bin=$(command -v badvpn-udpgw || echo /usr/local/bin/badvpn-udpgw)
   for p in "${BADVPN_PORTS[@]}"; do
