@@ -144,10 +144,13 @@ check_arch() {
 install_dependencies() {
   info "Memperbarui paket dan menginstal dependensi..."
   apt-get update
-  DEBIAN_FRONTEND=noninteractive apt-get install -y jq moreutils curl wget unzip net-tools openssl iptables-persistent ufw dropbear openvpn easy-rsa socat cron uuid-runtime build-essential cmake git vnstat || {
-    error "Gagal menginstal dependensi."
-    exit 1
-  }
+  DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    jq moreutils curl wget unzip net-tools openssl iptables-persistent ufw \
+    dropbear openvpn easy-rsa socat cron uuid-runtime build-essential cmake git \
+    vnstat haproxy nginx || {
+      error "Gagal menginstal dependensi."
+      exit 1
+    }
   ensure_badvpn_binary
   if ! command -v xray >/dev/null 2>&1; then
     info "Xray tidak ditemukan, memasang via installer resmi..."
@@ -196,6 +199,8 @@ obtain_ssl_certificate() {
   /root/.acme.sh/acme.sh --issue -d "$domain" --standalone -k ec-256
   /root/.acme.sh/acme.sh --installcert -d "$domain" --fullchainpath "$XRAY_CERT_FILE" --keypath "$XRAY_KEY_FILE" --ecc
   chmod 600 "$XRAY_CERT_FILE" "$XRAY_KEY_FILE"
+  cat "$XRAY_CERT_FILE" "$XRAY_KEY_FILE" > /etc/ssl/xray.pem
+  chmod 600 /etc/ssl/xray.pem
   ok "Sertifikat SSL terpasang di $XRAY_CERT_FILE"
 }
 
@@ -606,6 +611,8 @@ install_xray() {
 JSON
   systemctl enable xray
   systemctl restart xray
+  configure_haproxy "$domain"
+  configure_nginx "$domain"
 }
 
 reload_xray() {
@@ -1157,6 +1164,92 @@ fix_nginx() {
   else
     error "Nginx tidak terpasang"
   fi
+}
+
+configure_haproxy() {
+  local domain=$1
+  if ! command -v haproxy >/dev/null 2>&1; then
+    error "HAProxy belum terpasang; jalankan 'tunnelctl install' untuk memasang dependensi."
+    return 1
+  fi
+
+  cat >/etc/haproxy/haproxy.cfg <<HAP
+global
+  log /dev/log    local0
+  log /dev/log    local1 notice
+  chroot /var/lib/haproxy
+  stats socket /run/haproxy/admin.sock mode 660 level admin expose-fd listeners
+  stats timeout 30s
+  user haproxy
+  group haproxy
+  daemon
+
+defaults
+  log     global
+  mode    http
+  option  httplog
+  option  dontlognull
+  timeout connect 5s
+  timeout client  50s
+  timeout server  50s
+
+frontend https_in
+  bind *:443 ssl crt /etc/ssl/xray.pem alpn h2,http/1.1
+  http-request set-header X-Forwarded-Proto https
+  http-request set-header X-Forwarded-Host %[req.hdr(host)]
+  acl is_vmess path_beg -i /vmess
+  acl is_vless path_beg -i /vless
+  use_backend vmess_ws if is_vmess
+  use_backend vless_ws if is_vless
+  default_backend vmess_ws
+
+frontend http_in
+  bind *:80
+  mode http
+  http-request set-header X-Forwarded-Proto http
+  http-request redirect scheme https code 301 if !{ ssl_fc }
+
+backend vmess_ws
+  option http-server-close
+  server xray_vmess 127.0.0.1:${XRAY_VMESS_PORT} ssl verify none alpn h2,http/1.1
+
+backend vless_ws
+  option http-server-close
+  server xray_vless 127.0.0.1:${XRAY_VLESS_PORT} ssl verify none alpn h2,http/1.1
+HAP
+
+  systemctl enable haproxy
+  systemctl restart haproxy
+  ok "Konfigurasi HAProxy diterapkan untuk domain ${domain}"
+}
+
+configure_nginx() {
+  local domain=$1
+  if ! command -v nginx >/dev/null 2>&1; then
+    error "Nginx belum terpasang; jalankan 'tunnelctl install' untuk memasang dependensi."
+    return 1
+  fi
+
+  cat >/etc/nginx/sites-available/tunnel <<NGX
+server {
+  listen 80 default_server;
+  server_name ${domain} _;
+
+  location /health {
+    return 200 'ok';
+    add_header Content-Type text/plain;
+  }
+
+  location / {
+    return 301 https://\$host\$request_uri;
+  }
+}
+NGX
+
+  ln -sf /etc/nginx/sites-available/tunnel /etc/nginx/sites-enabled/tunnel
+  rm -f /etc/nginx/sites-enabled/default
+  nginx -t && systemctl reload nginx
+  ok "Konfigurasi Nginx diterapkan untuk domain ${domain}"
 }
 
 fix_xray_service() {
