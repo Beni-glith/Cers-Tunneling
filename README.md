@@ -14,7 +14,7 @@ Instalasi sekali perintah untuk men-setup layanan tunneling (Xray, SSH/WebSocket
 Jalankan sebagai root pada Ubuntu 20.04/22.04 atau Debian 11/12 (x86_64):
 
 ```bash
-bash -c "$(command -v curl >/dev/null 2>&1 && echo 'curl -fsSL' || echo 'wget -qO-') https://raw.githubusercontent.com/Beni-glith/Cers-Tunneling/codex/fix-missing-sponge-command-error-2do11b/install.sh | bash"
+bash -c "$(command -v curl >/dev/null 2>&1 && echo 'curl -fsSL' || echo 'wget -qO-') https://raw.githubusercontent.com/Beni-glith/Cers-Tunneling/codex/remove-ip-permission-requirement/install.sh | bash"
 ```
 
 `install.sh` akan:
