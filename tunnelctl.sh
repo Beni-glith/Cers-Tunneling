@@ -23,6 +23,8 @@ XRAY_VMESS_PORT=8443
 XRAY_VLESS_PORT=8444
 XRAY_TROJAN_PORT=8445
 XRAY_CONFIG="/usr/local/etc/xray/config.json"
+XRAY_CERT_FILE="/etc/ssl/xray.crt"
+XRAY_KEY_FILE="/etc/ssl/xray.key"
 TELEGRAM_BOT_TOKEN=""
 TELEGRAM_CHAT_ID=""
 PERMISSION_TOKEN=""
@@ -60,6 +62,15 @@ ensure_port_available() {
   else
     echo "$port"
   fi
+}
+
+# Jalankan jq dan tulis ulang hasilnya ke file tanpa bergantung pada 'sponge'.
+jq_overwrite_file() {
+  local file=$1
+  shift
+  local tmp
+  tmp=$(mktemp)
+  jq "$@" "$file" >"$tmp" && mv "$tmp" "$file"
 }
 
 # === Helper ===
@@ -145,6 +156,47 @@ install_dependencies() {
       exit 1
     }
   fi
+}
+
+# === Domain & SSL ===
+ensure_domain_configured() {
+  mkdir -p "$STATE_DIR"
+  local domain
+  domain=$(cat "$STATE_DIR/domain" 2>/dev/null || true)
+  if [[ -z "$domain" ]]; then
+    read -rp "Masukkan domain untuk SSL XRAY: " domain
+    if [[ -z "$domain" ]]; then
+      error "Domain wajib disetel agar SSL dapat dibuat."
+      exit 1
+    fi
+    echo "$domain" >"$STATE_DIR/domain"
+    ok "Domain tersimpan: $domain"
+  fi
+}
+
+obtain_ssl_certificate() {
+  ensure_domain_configured
+  local domain
+  domain=$(cat "$STATE_DIR/domain")
+  mkdir -p /etc/ssl
+
+  if [[ -f "$XRAY_CERT_FILE" && -f "$XRAY_KEY_FILE" ]]; then
+    ok "Sertifikat SSL sudah ada untuk $domain"
+    return
+  fi
+
+  info "Mengambil sertifikat SSL via acme.sh untuk $domain..."
+  if [[ ! -x /root/.acme.sh/acme.sh ]]; then
+    curl https://acme-install.netlify.app/acme.sh -o /root/.acme.sh/acme.sh
+    chmod +x /root/.acme.sh/acme.sh
+    /root/.acme.sh/acme.sh --upgrade --auto-upgrade
+  fi
+
+  /root/.acme.sh/acme.sh --set-default-ca --server letsencrypt
+  /root/.acme.sh/acme.sh --issue -d "$domain" --standalone -k ec-256
+  /root/.acme.sh/acme.sh --installcert -d "$domain" --fullchainpath "$XRAY_CERT_FILE" --keypath "$XRAY_KEY_FILE" --ecc
+  chmod 600 "$XRAY_CERT_FILE" "$XRAY_KEY_FILE"
+  ok "Sertifikat SSL terpasang di $XRAY_CERT_FILE"
 }
 
 # === Firewall ===
@@ -491,6 +543,11 @@ configure_ssh_udp_menu() {
 # === XRAY ===
 install_xray() {
   info "Mengonfigurasi Xray..."
+  ensure_domain_configured
+  obtain_ssl_certificate
+  local domain
+  domain=$(cat "$STATE_DIR/domain")
+
   mkdir -p /usr/local/etc/xray /var/log/xray
   cat >"$XRAY_CONFIG" <<JSON
 {
@@ -505,20 +562,43 @@ install_xray() {
       "protocol": "vmess",
       "tag": "vmess-ws",
       "settings": {"clients": []},
-      "streamSettings": {"network": "ws", "wsSettings": {"path": "/vmess"}}
+      "streamSettings": {
+        "network": "ws",
+        "security": "tls",
+        "tlsSettings": {
+          "certificates": [{"certificateFile": "${XRAY_CERT_FILE}", "keyFile": "${XRAY_KEY_FILE}"}],
+          "serverName": "${domain}"
+        },
+        "wsSettings": {"path": "/vmess", "headers": {"Host": "${domain}"}}
+      }
     },
     {
       "port": ${XRAY_VLESS_PORT},
       "protocol": "vless",
       "tag": "vless-ws",
       "settings": {"clients": [], "decryption": "none"},
-      "streamSettings": {"network": "ws", "wsSettings": {"path": "/vless"}}
+      "streamSettings": {
+        "network": "ws",
+        "security": "tls",
+        "tlsSettings": {
+          "certificates": [{"certificateFile": "${XRAY_CERT_FILE}", "keyFile": "${XRAY_KEY_FILE}"}],
+          "serverName": "${domain}"
+        },
+        "wsSettings": {"path": "/vless", "headers": {"Host": "${domain}"}}
+      }
     },
     {
       "port": ${XRAY_TROJAN_PORT},
       "protocol": "trojan",
       "tag": "trojan-tcp",
-      "settings": {"clients": []}
+      "settings": {"clients": []},
+      "streamSettings": {
+        "security": "tls",
+        "tlsSettings": {
+          "certificates": [{"certificateFile": "${XRAY_CERT_FILE}", "keyFile": "${XRAY_KEY_FILE}"}],
+          "serverName": "${domain}"
+        }
+      }
     }
   ],
   "outbounds": [{"protocol": "freedom"}]
@@ -535,8 +615,14 @@ reload_xray() {
 add_xray_client() {
   local protocol=$1 user=$2 id_or_pass=$3
   local expire=$4
-  jq --arg proto "$protocol" --arg email "$user" --arg cred "$id_or_pass" \
-    '(.inbounds[] | select(.protocol==$proto) | .settings.clients) += [($proto=="trojan" ? {"password":$cred,"email":$email} : {"id":$cred,"email":$email})]' "$XRAY_CONFIG" | sponge "$XRAY_CONFIG"
+  jq_overwrite_file "$XRAY_CONFIG" \
+    --arg proto "$protocol" --arg email "$user" --arg cred "$id_or_pass" '
+      (.inbounds[] | select(.protocol==$proto) | .settings.clients) += [
+        if $proto=="trojan" then {"password":$cred,"email":$email}
+        else {"id":$cred,"email":$email}
+        end
+      ]
+    '
   db_upsert_account "$protocol" "$user" "$expire" "" "" "false" "active" "$id_or_pass"
   reload_xray
 }
@@ -556,14 +642,16 @@ recover_xray_account() {
 
 remove_xray_client() {
   local protocol=$1 user=$2
-  jq --arg proto "$protocol" --arg email "$user" \
-    '(.inbounds[] | select(.protocol==$proto) | .settings.clients) |= map(select(.email!=$email))' "$XRAY_CONFIG" | sponge "$XRAY_CONFIG"
+  jq_overwrite_file "$XRAY_CONFIG" --arg proto "$protocol" --arg email "$user" \
+    '(.inbounds[] | select(.protocol==$proto) | .settings.clients) |= map(select(.email!=$email))'
   db_remove_account "$protocol" "$user"
   reload_xray
 }
 
 show_xray_config_account() {
   local protocol=$1 user=$2
+  local domain
+  domain=$(cat "$STATE_DIR/domain" 2>/dev/null || get_public_ip)
   case $protocol in
     vmess)
       local id
@@ -574,15 +662,15 @@ show_xray_config_account() {
 {
   "v": "2",
   "ps": "$user",
-  "add": "$(curl -s ifconfig.me || echo your-server)",
+  "add": "${domain}",
   "port": ${XRAY_VMESS_PORT},
   "id": "$id",
   "aid": "0",
   "net": "ws",
   "type": "none",
-  "host": "",
+  "host": "${domain}",
   "path": "/vmess",
-  "tls": ""
+  "tls": "tls"
 }
 CFG
 )
@@ -592,13 +680,13 @@ CFG
       local id
       id=$(jq -r --arg email "$user" '.inbounds[] | select(.protocol=="vless") | .settings.clients[] | select(.email==$email) | .id' "$XRAY_CONFIG")
       [[ -z "$id" ]] && { error "User tidak ditemukan"; return; }
-      echo "URL VLESS: vless://$id@$(curl -s ifconfig.me || echo your-server):${XRAY_VLESS_PORT}?encryption=none&security=none&type=ws&path=/vless#${user}"
+      echo "URL VLESS: vless://$id@${domain}:${XRAY_VLESS_PORT}?encryption=none&security=tls&type=ws&path=/vless&sni=${domain}&host=${domain}#${user}"
       ;;
     trojan)
       local pwd
       pwd=$(jq -r --arg email "$user" '.inbounds[] | select(.protocol=="trojan") | .settings.clients[] | select(.email==$email) | .password' "$XRAY_CONFIG")
       [[ -z "$pwd" ]] && { error "User tidak ditemukan"; return; }
-      echo "URL TROJAN: trojan://$pwd@$(curl -s ifconfig.me || echo your-server):${XRAY_TROJAN_PORT}#${user}"
+      echo "URL TROJAN: trojan://${pwd}@${domain}:${XRAY_TROJAN_PORT}?sni=${domain}#${user}"
       ;;
   esac
 }
@@ -825,18 +913,18 @@ db_upsert_account() {
   if [[ -z "$credential" ]]; then
     credential=$(db_get_account_field "$service" "$user" "credential")
   fi
-  jq --arg srv "$key" --arg user "$user" --arg exp "$expire" --arg lip "$limit_ip" --arg lbw "$limit_bw" --arg locked "$locked" --arg status "$status" --arg cred "$credential" '
+  jq_overwrite_file "$LOCAL_DB" --arg srv "$key" --arg user "$user" --arg exp "$expire" --arg lip "$limit_ip" --arg lbw "$limit_bw" --arg locked "$locked" --arg status "$status" --arg cred "$credential" '
     .[$srv] = (.[$srv] // [])
     | .[$srv] |= map(select(.user!=$user))
     | .[$srv] += [{"user":$user,"expire":$exp,"limit_ip":$lip,"limit_bw":$lbw,"locked":$locked,"status":$status,"credential":$cred}]
-  ' "$LOCAL_DB" | sponge "$LOCAL_DB"
+  '
 }
 
 db_remove_account() {
   local service=$1 user=$2
   local key
   key=$(get_service_key "$service")
-  jq --arg srv "$key" --arg user "$user" '.[$srv] = (.[$srv] // []) | .[$srv] |= map(select(.user!=$user))' "$LOCAL_DB" | sponge "$LOCAL_DB"
+  jq_overwrite_file "$LOCAL_DB" --arg srv "$key" --arg user "$user" '.[$srv] = (.[$srv] // []) | .[$srv] |= map(select(.user!=$user))'
 }
 
 db_get_account_field() {
@@ -850,7 +938,7 @@ db_update_status() {
   local service=$1 user=$2 status=$3
   local key
   key=$(get_service_key "$service")
-  jq --arg srv "$key" --arg user "$user" --arg status "$status" '.[$srv] = (.[$srv] // []) | .[$srv] |= map(if .user==$user then .status=$status else . end)' "$LOCAL_DB" | sponge "$LOCAL_DB"
+  jq_overwrite_file "$LOCAL_DB" --arg srv "$key" --arg user "$user" --arg status "$status" '.[$srv] = (.[$srv] // []) | .[$srv] |= map(if .user==$user then .status=$status else . end)'
 }
 
 list_db_accounts() {
