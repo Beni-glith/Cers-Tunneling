@@ -14,6 +14,7 @@ STATE_FILE="$STATE_DIR/settings.conf"
 PERMISSION_FLAG_FILE="$STATE_DIR/.permission_granted"
 IP_ALLOWLIST_FILE="$STATE_DIR/allowed_ips"
 ALLOWLIST_TEMPLATE="$SOURCE_DIR/allowed_ips.conf"
+ALLOWLIST_REMOTE_URL=${ALLOWLIST_REMOTE_URL:-"https://raw.githubusercontent.com/Cers-Tunneling/Cers-Tunneling/main/allowed_ips.conf"}
 BACKUP_CRON="/etc/cron.d/auto-backup-tunnel"
 
 info() { echo "[INFO] $*"; }
@@ -75,37 +76,49 @@ detect_public_ip() {
 
 configure_ip_allowlist() {
   mkdir -p "$STATE_DIR"
-  local from_template=false
-  if [[ -s "$ALLOWLIST_TEMPLATE" ]]; then
-    info "Menyalin daftar izin IP dari template $ALLOWLIST_TEMPLATE."
+  if fetch_remote_allowlist; then
+    set_state allowlist_remote_url "$ALLOWLIST_REMOTE_URL"
+    ok "Daftar izin IP diunduh dari GitHub dan disimpan di $IP_ALLOWLIST_FILE."
+  elif [[ -s "$ALLOWLIST_TEMPLATE" ]]; then
+    info "Gagal mengambil daftar izin dari GitHub, menggunakan cadangan lokal."
     install -m 0600 "$ALLOWLIST_TEMPLATE" "$IP_ALLOWLIST_FILE"
-    from_template=true
   else
-    : >"$IP_ALLOWLIST_FILE"
+    error "Tidak dapat mendapatkan daftar izin IP. Periksa koneksi internet lalu coba lagi."
+    exit 1
   fi
 
-  local current_ip ip_list existing_count
-  current_ip=$(detect_public_ip)
-  existing_count=$(grep -Evc '^(#|\s*$)' "$IP_ALLOWLIST_FILE")
-  if [[ "$existing_count" -eq 0 ]]; then
-    info "IP publik terdeteksi: ${current_ip:-tidak terdeteksi}"
-    read -rp "Daftar IP yang diizinkan (pisahkan dengan spasi) [default: ${current_ip:-wajib isi}]: " ip_list
-    if [[ -z "$ip_list" && -n "$current_ip" ]]; then
-      ip_list="$current_ip"
-    fi
-    if [[ -z "$ip_list" ]]; then
-      error "Minimal satu IP harus dicantumkan dalam daftar izin."
-      exit 1
-    fi
-    tr ' ' '\n' <<<"$ip_list" | sed '/^$/d' | sort -u >>"$IP_ALLOWLIST_FILE"
-  fi
+  verify_ip_allowed
+}
 
+fetch_remote_allowlist() {
+  if [[ -z "$ALLOWLIST_REMOTE_URL" ]]; then
+    return 1
+  fi
+  info "Mengambil izin IP dari $ALLOWLIST_REMOTE_URL"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$ALLOWLIST_REMOTE_URL" -o "$IP_ALLOWLIST_FILE" || return 1
+  else
+    wget -q "$ALLOWLIST_REMOTE_URL" -O "$IP_ALLOWLIST_FILE" || return 1
+  fi
   chmod 600 "$IP_ALLOWLIST_FILE"
-  if $from_template; then
-    ok "Daftar izin IP diimpor dari template dan disimpan di $IP_ALLOWLIST_FILE. Edit file ini untuk menambah atau mencabut izin."
-  else
-    ok "Daftar izin IP disimpan di $IP_ALLOWLIST_FILE. Edit file ini untuk menambah atau mencabut izin."
+}
+
+verify_ip_allowed() {
+  local ip
+  ip=$(detect_public_ip)
+  if [[ -z "$ip" ]]; then
+    error "Tidak dapat mendeteksi IP publik server; pastikan koneksi internet berfungsi."
+    exit 1
   fi
+  if [[ ! -s "$IP_ALLOWLIST_FILE" ]]; then
+    error "File izin IP kosong. Pastikan file dari GitHub berhasil diunduh."
+    exit 1
+  fi
+  if ! grep -Fxq "$ip" "$IP_ALLOWLIST_FILE"; then
+    error "IP $ip tidak memiliki izin dalam daftar GitHub. Hubungi pemilik script untuk mendapatkan akses."
+    exit 1
+  fi
+  ok "IP $ip terverifikasi dalam daftar izin."
 }
 
 configure_telegram() {

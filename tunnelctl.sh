@@ -36,6 +36,7 @@ SSH_UDP_STATE_FILE="$STATE_DIR/ssh_udp_ports"
 STATE_FILE="$STATE_DIR/settings.conf"
 PERMISSION_FLAG_FILE="$STATE_DIR/.permission_granted"
 IP_ALLOWLIST_FILE="$STATE_DIR/allowed_ips"
+ALLOWLIST_REMOTE_URL=${ALLOWLIST_REMOTE_URL:-"https://raw.githubusercontent.com/Cers-Tunneling/Cers-Tunneling/main/allowed_ips.conf"}
 ACTIVE_DROPBEAR_WS_PORT1="$DROPBEAR_WS_PORT1"
 ACTIVE_DROPBEAR_WS_PORT2="$DROPBEAR_WS_PORT2"
 ACTIVE_SSH_WS_SSL_PORT="$SSH_WS_SSL_PORT"
@@ -115,6 +116,7 @@ JSON
   TELEGRAM_BOT_TOKEN=$(get_state telegram_bot_token "$TELEGRAM_BOT_TOKEN")
   TELEGRAM_CHAT_ID=$(get_state telegram_chat_id "$TELEGRAM_CHAT_ID")
   PERMISSION_TOKEN=$(get_state permission_token "")
+  ALLOWLIST_REMOTE_URL=$(get_state allowlist_remote_url "$ALLOWLIST_REMOTE_URL")
 }
 
 # === Validasi Awal ===
@@ -288,6 +290,7 @@ ensure_permission() {
 }
 
 ensure_ip_allowed() {
+  sync_remote_allowlist || true
   local ip
   ip=$(get_public_ip)
   if [[ -z "$ip" ]]; then
@@ -302,6 +305,17 @@ ensure_ip_allowed() {
     error "IP $ip belum terdaftar pada daftar izin. Hubungi admin untuk menambahkan IP ini."
     exit 1
   fi
+}
+
+sync_remote_allowlist() {
+  [[ -z "$ALLOWLIST_REMOTE_URL" ]] && return 0
+  info "Sinkronisasi izin IP dari $ALLOWLIST_REMOTE_URL"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$ALLOWLIST_REMOTE_URL" -o "$IP_ALLOWLIST_FILE" || return 1
+  else
+    wget -q "$ALLOWLIST_REMOTE_URL" -O "$IP_ALLOWLIST_FILE" || return 1
+  fi
+  chmod 600 "$IP_ALLOWLIST_FILE"
 }
 
 # === OpenSSH ===

@@ -27,21 +27,24 @@ TMP_DIR=$(mktemp -d)
 cleanup() { rm -rf "$TMP_DIR"; }
 trap cleanup EXIT
 
-AUTO_SCRIPT_PATH="$TMP_DIR/auto-tunnel.sh"
-DOWNLOAD_URL="${RAW_BASE_URL}/auto-tunnel.sh"
+FILES=(auto-tunnel.sh tunnelctl.sh allowed_ips.conf)
+for file in "${FILES[@]}"; do
+  url="${RAW_BASE_URL}/${file}"
+  dest="$TMP_DIR/$file"
+  echo "[INFO] Mengunduh $file dari $url"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$url" -o "$dest"
+  else
+    wget -q "$url" -O "$dest"
+  fi
+done
 
-if command -v curl >/dev/null 2>&1; then
-  curl -fsSL "$DOWNLOAD_URL" -o "$AUTO_SCRIPT_PATH"
-else
-  wget -q "$DOWNLOAD_URL" -O "$AUTO_SCRIPT_PATH"
-fi
+chmod +x "$TMP_DIR/auto-tunnel.sh"
 
-chmod +x "$AUTO_SCRIPT_PATH"
-
-# Jalankan installer utama.
-"$AUTO_SCRIPT_PATH"
+# Jalankan installer utama dari bundle unduhan sementara.
+"$TMP_DIR/auto-tunnel.sh"
 
 cat <<MSG
-[OK] Instalasi selesai. Jika menggunakan GitHub, contoh perintah satu baris:
+[OK] Instalasi selesai. Contoh perintah satu baris dari GitHub:
   bash -c "$(command -v curl >/dev/null 2>&1 && echo "curl -fsSL" || echo "wget -qO-") https://raw.githubusercontent.com/${REPO_SLUG}/${REPO_BRANCH}/install.sh | bash"
 MSG
