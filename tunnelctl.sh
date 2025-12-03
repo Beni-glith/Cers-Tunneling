@@ -633,16 +633,35 @@ reload_xray() {
   systemctl restart xray
 }
 
+resolve_xray_credential() {
+  local protocol=$1 user=$2
+  local cred
+  cred=$(db_get_account_field "$protocol" "$user" "credential")
+  if [[ -z "$cred" || "$cred" == "null" ]]; then
+    case $protocol in
+      vmess|vless)
+        cred=$(jq -r --arg proto "$protocol" --arg email "$user" '.inbounds[] | select(.protocol==$proto) | .settings.clients[] | select(.email==$email) | .id' "$XRAY_CONFIG")
+        ;;
+      trojan)
+        cred=$(jq -r --arg email "$user" '.inbounds[] | select(.protocol=="trojan") | .settings.clients[] | select(.email==$email) | .password' "$XRAY_CONFIG")
+        ;;
+    esac
+  fi
+  echo "$cred"
+}
+
 add_xray_client() {
   local protocol=$1 user=$2 id_or_pass=$3
   local expire=$4
   jq_overwrite_file "$XRAY_CONFIG" \
     --arg proto "$protocol" --arg email "$user" --arg cred "$id_or_pass" '
-      (.inbounds[] | select(.protocol==$proto) | .settings.clients) += [
-        if $proto=="trojan" then {"password":$cred,"email":$email}
-        else {"id":$cred,"email":$email}
-        end
-      ]
+      (.inbounds[] | select(.protocol==$proto) | .settings.clients) |= (
+        map(select(.email!=$email)) + [
+          if $proto=="trojan" then {"password":$cred,"email":$email}
+          else {"id":$cred,"email":$email}
+          end
+        ]
+      )
     '
   db_upsert_account "$protocol" "$user" "$expire" "" "" "false" "active" "$id_or_pass"
   reload_xray
@@ -667,6 +686,20 @@ remove_xray_client() {
     '(.inbounds[] | select(.protocol==$proto) | .settings.clients) |= map(select(.email!=$email))'
   db_remove_account "$protocol" "$user"
   reload_xray
+}
+
+renew_xray_client() {
+  local protocol=$1 user=$2 days=$3
+  local new_expire
+  new_expire=$(date -d "+$days days" +%Y-%m-%d)
+  local cred
+  cred=$(resolve_xray_credential "$protocol" "$user")
+  if [[ -z "$cred" || "$cred" == "null" ]]; then
+    error "Credential untuk $user ($protocol) tidak ditemukan di database ataupun config."
+    return 1
+  fi
+  add_xray_client "$protocol" "$user" "$cred" "$new_expire"
+  ok "Akun $user ($protocol) diperpanjang sampai $new_expire"
 }
 
 show_xray_config_account() {
@@ -1559,7 +1592,7 @@ MENU
     3) read -rp "Username: " u; read -rp "Masa aktif (hari): " d; add_xray_client vmess "$u" "$(generate_uuid)" "$(date -d "+$d days" +%Y-%m-%d)";;
     4) read -rp "Username: " u; add_xray_client vmess "$u" "$(generate_uuid)" "$(date -d "+1 day" +%Y-%m-%d)";;
     5) read -rp "Username: " u; remove_xray_client vmess "$u";;
-    6) read -rp "Username: " u; read -rp "Perpanjang (hari): " d; db_upsert_account vmess "$u" "$(date -d "+$d days" +%Y-%m-%d)" "" "" "false" "active";;
+    6) read -rp "Username: " u; read -rp "Perpanjang (hari): " d; renew_xray_client vmess "$u" "$d";;
     7) read -rp "Username: " u; show_xray_config_account vmess "$u";;
     8) read -rp "Username: " u; recover_xray_account vmess "$u";;
     9) read -rp "Username: " u; read -rp "Limit IP: " l; db_upsert_account vmess "$u" "" "$l" "" "false" "active";;
@@ -1569,7 +1602,7 @@ MENU
     13) read -rp "Username: " u; read -rp "Masa aktif (hari): " d; add_xray_client vless "$u" "$(generate_uuid)" "$(date -d "+$d days" +%Y-%m-%d)";;
     14) read -rp "Username: " u; add_xray_client vless "$u" "$(generate_uuid)" "$(date -d "+1 day" +%Y-%m-%d)";;
     15) read -rp "Username: " u; remove_xray_client vless "$u";;
-    16) read -rp "Username: " u; read -rp "Perpanjang (hari): " d; db_upsert_account vless "$u" "$(date -d "+$d days" +%Y-%m-%d)" "" "" "false" "active";;
+    16) read -rp "Username: " u; read -rp "Perpanjang (hari): " d; renew_xray_client vless "$u" "$d";;
     17) read -rp "Username: " u; show_xray_config_account vless "$u";;
     18) read -rp "Username: " u; recover_xray_account vless "$u";;
     19) read -rp "Username: " u; read -rp "Limit IP: " l; db_upsert_account vless "$u" "" "$l" "" "false" "active";;
@@ -1607,7 +1640,7 @@ MENU
     3) read -rp "Username: " u; read -rp "Masa aktif (hari): " d; add_xray_client trojan "$u" "$(generate_random_password)" "$(date -d "+$d days" +%Y-%m-%d)";;
     4) read -rp "Username: " u; add_xray_client trojan "$u" "$(generate_random_password)" "$(date -d "+1 day" +%Y-%m-%d)";;
     5) read -rp "Username: " u; remove_xray_client trojan "$u";;
-    6) read -rp "Username: " u; read -rp "Perpanjang (hari): " d; db_upsert_account trojan "$u" "$(date -d "+$d days" +%Y-%m-%d)" "" "" "false" "active";;
+    6) read -rp "Username: " u; read -rp "Perpanjang (hari): " d; renew_xray_client trojan "$u" "$d";;
     7) read -rp "Username: " u; show_xray_config_account trojan "$u";;
     8) read -rp "Username: " u; recover_xray_account trojan "$u";;
     9) read -rp "Username: " u; read -rp "Limit IP: " l; db_upsert_account trojan "$u" "" "$l" "" "false" "active";;
