@@ -23,6 +23,8 @@ XRAY_VMESS_PORT=8443
 XRAY_VLESS_PORT=8444
 XRAY_TROJAN_PORT=8445
 XRAY_CONFIG="/usr/local/etc/xray/config.json"
+XRAY_CERT_FILE="/etc/ssl/xray.crt"
+XRAY_KEY_FILE="/etc/ssl/xray.key"
 TELEGRAM_BOT_TOKEN=""
 TELEGRAM_CHAT_ID=""
 PERMISSION_TOKEN=""
@@ -34,6 +36,7 @@ SSH_UDP_STATE_FILE="$STATE_DIR/ssh_udp_ports"
 STATE_FILE="$STATE_DIR/settings.conf"
 PERMISSION_FLAG_FILE="$STATE_DIR/.permission_granted"
 IP_ALLOWLIST_FILE="$STATE_DIR/allowed_ips"
+ALLOWLIST_REMOTE_URL=${ALLOWLIST_REMOTE_URL:-"https://raw.githubusercontent.com/Cers-Tunneling/Cers-Tunneling/main/allowed_ips.conf"}
 ACTIVE_DROPBEAR_WS_PORT1="$DROPBEAR_WS_PORT1"
 ACTIVE_DROPBEAR_WS_PORT2="$DROPBEAR_WS_PORT2"
 ACTIVE_SSH_WS_SSL_PORT="$SSH_WS_SSL_PORT"
@@ -62,11 +65,29 @@ ensure_port_available() {
   fi
 }
 
+# Jalankan jq dan tulis ulang hasilnya ke file tanpa bergantung pada 'sponge'.
+jq_overwrite_file() {
+  local file=$1
+  shift
+  local tmp
+  tmp=$(mktemp)
+  jq "$@" "$file" >"$tmp" && mv "$tmp" "$file"
+}
+
 # === Helper ===
 generate_uuid() { uuidgen; }
 generate_random_password() { head -c 16 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 16; }
 generate_random_port() { shuf -i 20000-40000 -n 1; }
 get_public_ip() { curl -s https://api.ipify.org 2>/dev/null || curl -s https://ifconfig.me 2>/dev/null; }
+is_ip_in_allowlist() {
+  local ip=$1 file=$2
+  awk -v ip="$ip" '
+    /^[[:space:]]*#/ {next}
+    { gsub(/#.*/, "", $0); gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0) }
+    NF && $0 == ip { exit 0 }
+    END { exit 1 }
+  ' "$file"
+}
 
 get_city() {
   curl -s ipinfo.io/city 2>/dev/null || echo "-"
@@ -104,6 +125,7 @@ JSON
   TELEGRAM_BOT_TOKEN=$(get_state telegram_bot_token "$TELEGRAM_BOT_TOKEN")
   TELEGRAM_CHAT_ID=$(get_state telegram_chat_id "$TELEGRAM_CHAT_ID")
   PERMISSION_TOKEN=$(get_state permission_token "")
+  ALLOWLIST_REMOTE_URL=$(get_state allowlist_remote_url "$ALLOWLIST_REMOTE_URL")
 }
 
 # === Validasi Awal ===
@@ -115,8 +137,8 @@ check_root() {
 }
 
 check_os() {
-  if ! grep -qi "ubuntu" /etc/os-release; then
-    error "Hanya mendukung Ubuntu 20.04/22.04."
+  if ! grep -qiE "ubuntu|debian" /etc/os-release; then
+    error "Hanya mendukung Ubuntu 20.04/22.04 atau Debian 11/12."
     exit 1
   fi
 }
@@ -133,10 +155,13 @@ check_arch() {
 install_dependencies() {
   info "Memperbarui paket dan menginstal dependensi..."
   apt-get update
-  DEBIAN_FRONTEND=noninteractive apt-get install -y jq moreutils curl wget unzip net-tools openssl iptables-persistent ufw dropbear openvpn easy-rsa socat cron uuid-runtime build-essential cmake git vnstat || {
-    error "Gagal menginstal dependensi."
-    exit 1
-  }
+  DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    jq moreutils curl wget unzip net-tools openssl iptables-persistent ufw \
+    dropbear openvpn easy-rsa socat cron uuid-runtime build-essential cmake git \
+    vnstat haproxy nginx || {
+      error "Gagal menginstal dependensi."
+      exit 1
+    }
   ensure_badvpn_binary
   if ! command -v xray >/dev/null 2>&1; then
     info "Xray tidak ditemukan, memasang via installer resmi..."
@@ -145,6 +170,49 @@ install_dependencies() {
       exit 1
     }
   fi
+}
+
+# === Domain & SSL ===
+ensure_domain_configured() {
+  mkdir -p "$STATE_DIR"
+  local domain
+  domain=$(cat "$STATE_DIR/domain" 2>/dev/null || true)
+  if [[ -z "$domain" ]]; then
+    read -rp "Masukkan domain untuk SSL XRAY: " domain
+    if [[ -z "$domain" ]]; then
+      error "Domain wajib disetel agar SSL dapat dibuat."
+      exit 1
+    fi
+    echo "$domain" >"$STATE_DIR/domain"
+    ok "Domain tersimpan: $domain"
+  fi
+}
+
+obtain_ssl_certificate() {
+  ensure_domain_configured
+  local domain
+  domain=$(cat "$STATE_DIR/domain")
+  mkdir -p /etc/ssl
+
+  if [[ -f "$XRAY_CERT_FILE" && -f "$XRAY_KEY_FILE" ]]; then
+    ok "Sertifikat SSL sudah ada untuk $domain"
+    return
+  fi
+
+  info "Mengambil sertifikat SSL via acme.sh untuk $domain..."
+  if [[ ! -x /root/.acme.sh/acme.sh ]]; then
+    curl https://acme-install.netlify.app/acme.sh -o /root/.acme.sh/acme.sh
+    chmod +x /root/.acme.sh/acme.sh
+    /root/.acme.sh/acme.sh --upgrade --auto-upgrade
+  fi
+
+  /root/.acme.sh/acme.sh --set-default-ca --server letsencrypt
+  /root/.acme.sh/acme.sh --issue -d "$domain" --standalone -k ec-256
+  /root/.acme.sh/acme.sh --installcert -d "$domain" --fullchainpath "$XRAY_CERT_FILE" --keypath "$XRAY_KEY_FILE" --ecc
+  chmod 600 "$XRAY_CERT_FILE" "$XRAY_KEY_FILE"
+  cat "$XRAY_CERT_FILE" "$XRAY_KEY_FILE" > /etc/ssl/xray.pem
+  chmod 600 /etc/ssl/xray.pem
+  ok "Sertifikat SSL terpasang di $XRAY_CERT_FILE"
 }
 
 # === Firewall ===
@@ -231,6 +299,7 @@ ensure_permission() {
 }
 
 ensure_ip_allowed() {
+  sync_remote_allowlist || true
   local ip
   ip=$(get_public_ip)
   if [[ -z "$ip" ]]; then
@@ -241,10 +310,21 @@ ensure_ip_allowed() {
     error "File izin IP tidak ditemukan di $IP_ALLOWLIST_FILE. Jalankan installer untuk membuatnya."
     exit 1
   fi
-  if ! grep -Fxq "$ip" "$IP_ALLOWLIST_FILE"; then
+  if ! is_ip_in_allowlist "$ip" "$IP_ALLOWLIST_FILE"; then
     error "IP $ip belum terdaftar pada daftar izin. Hubungi admin untuk menambahkan IP ini."
     exit 1
   fi
+}
+
+sync_remote_allowlist() {
+  [[ -z "$ALLOWLIST_REMOTE_URL" ]] && return 0
+  info "Sinkronisasi izin IP dari $ALLOWLIST_REMOTE_URL"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$ALLOWLIST_REMOTE_URL" -o "$IP_ALLOWLIST_FILE" || return 1
+  else
+    wget -q "$ALLOWLIST_REMOTE_URL" -O "$IP_ALLOWLIST_FILE" || return 1
+  fi
+  chmod 600 "$IP_ALLOWLIST_FILE"
 }
 
 # === OpenSSH ===
@@ -491,6 +571,11 @@ configure_ssh_udp_menu() {
 # === XRAY ===
 install_xray() {
   info "Mengonfigurasi Xray..."
+  ensure_domain_configured
+  obtain_ssl_certificate
+  local domain
+  domain=$(cat "$STATE_DIR/domain")
+
   mkdir -p /usr/local/etc/xray /var/log/xray
   cat >"$XRAY_CONFIG" <<JSON
 {
@@ -505,20 +590,43 @@ install_xray() {
       "protocol": "vmess",
       "tag": "vmess-ws",
       "settings": {"clients": []},
-      "streamSettings": {"network": "ws", "wsSettings": {"path": "/vmess"}}
+      "streamSettings": {
+        "network": "ws",
+        "security": "tls",
+        "tlsSettings": {
+          "certificates": [{"certificateFile": "${XRAY_CERT_FILE}", "keyFile": "${XRAY_KEY_FILE}"}],
+          "serverName": "${domain}"
+        },
+        "wsSettings": {"path": "/vmess", "headers": {"Host": "${domain}"}}
+      }
     },
     {
       "port": ${XRAY_VLESS_PORT},
       "protocol": "vless",
       "tag": "vless-ws",
       "settings": {"clients": [], "decryption": "none"},
-      "streamSettings": {"network": "ws", "wsSettings": {"path": "/vless"}}
+      "streamSettings": {
+        "network": "ws",
+        "security": "tls",
+        "tlsSettings": {
+          "certificates": [{"certificateFile": "${XRAY_CERT_FILE}", "keyFile": "${XRAY_KEY_FILE}"}],
+          "serverName": "${domain}"
+        },
+        "wsSettings": {"path": "/vless", "headers": {"Host": "${domain}"}}
+      }
     },
     {
       "port": ${XRAY_TROJAN_PORT},
       "protocol": "trojan",
       "tag": "trojan-tcp",
-      "settings": {"clients": []}
+      "settings": {"clients": []},
+      "streamSettings": {
+        "security": "tls",
+        "tlsSettings": {
+          "certificates": [{"certificateFile": "${XRAY_CERT_FILE}", "keyFile": "${XRAY_KEY_FILE}"}],
+          "serverName": "${domain}"
+        }
+      }
     }
   ],
   "outbounds": [{"protocol": "freedom"}]
@@ -526,17 +634,44 @@ install_xray() {
 JSON
   systemctl enable xray
   systemctl restart xray
+  configure_haproxy "$domain"
+  configure_nginx "$domain"
 }
 
 reload_xray() {
   systemctl restart xray
 }
 
+resolve_xray_credential() {
+  local protocol=$1 user=$2
+  local cred
+  cred=$(db_get_account_field "$protocol" "$user" "credential")
+  if [[ -z "$cred" || "$cred" == "null" ]]; then
+    case $protocol in
+      vmess|vless)
+        cred=$(jq -r --arg proto "$protocol" --arg email "$user" '.inbounds[] | select(.protocol==$proto) | .settings.clients[] | select(.email==$email) | .id' "$XRAY_CONFIG")
+        ;;
+      trojan)
+        cred=$(jq -r --arg email "$user" '.inbounds[] | select(.protocol=="trojan") | .settings.clients[] | select(.email==$email) | .password' "$XRAY_CONFIG")
+        ;;
+    esac
+  fi
+  echo "$cred"
+}
+
 add_xray_client() {
   local protocol=$1 user=$2 id_or_pass=$3
   local expire=$4
-  jq --arg proto "$protocol" --arg email "$user" --arg cred "$id_or_pass" \
-    '(.inbounds[] | select(.protocol==$proto) | .settings.clients) += [($proto=="trojan" ? {"password":$cred,"email":$email} : {"id":$cred,"email":$email})]' "$XRAY_CONFIG" | sponge "$XRAY_CONFIG"
+  jq_overwrite_file "$XRAY_CONFIG" \
+    --arg proto "$protocol" --arg email "$user" --arg cred "$id_or_pass" '
+      (.inbounds[] | select(.protocol==$proto) | .settings.clients) |= (
+        map(select(.email!=$email)) + [
+          if $proto=="trojan" then {"password":$cred,"email":$email}
+          else {"id":$cred,"email":$email}
+          end
+        ]
+      )
+    '
   db_upsert_account "$protocol" "$user" "$expire" "" "" "false" "active" "$id_or_pass"
   reload_xray
 }
@@ -556,14 +691,30 @@ recover_xray_account() {
 
 remove_xray_client() {
   local protocol=$1 user=$2
-  jq --arg proto "$protocol" --arg email "$user" \
-    '(.inbounds[] | select(.protocol==$proto) | .settings.clients) |= map(select(.email!=$email))' "$XRAY_CONFIG" | sponge "$XRAY_CONFIG"
+  jq_overwrite_file "$XRAY_CONFIG" --arg proto "$protocol" --arg email "$user" \
+    '(.inbounds[] | select(.protocol==$proto) | .settings.clients) |= map(select(.email!=$email))'
   db_remove_account "$protocol" "$user"
   reload_xray
 }
 
+renew_xray_client() {
+  local protocol=$1 user=$2 days=$3
+  local new_expire
+  new_expire=$(date -d "+$days days" +%Y-%m-%d)
+  local cred
+  cred=$(resolve_xray_credential "$protocol" "$user")
+  if [[ -z "$cred" || "$cred" == "null" ]]; then
+    error "Credential untuk $user ($protocol) tidak ditemukan di database ataupun config."
+    return 1
+  fi
+  add_xray_client "$protocol" "$user" "$cred" "$new_expire"
+  ok "Akun $user ($protocol) diperpanjang sampai $new_expire"
+}
+
 show_xray_config_account() {
   local protocol=$1 user=$2
+  local domain
+  domain=$(cat "$STATE_DIR/domain" 2>/dev/null || get_public_ip)
   case $protocol in
     vmess)
       local id
@@ -574,15 +725,15 @@ show_xray_config_account() {
 {
   "v": "2",
   "ps": "$user",
-  "add": "$(curl -s ifconfig.me || echo your-server)",
+  "add": "${domain}",
   "port": ${XRAY_VMESS_PORT},
   "id": "$id",
   "aid": "0",
   "net": "ws",
   "type": "none",
-  "host": "",
+  "host": "${domain}",
   "path": "/vmess",
-  "tls": ""
+  "tls": "tls"
 }
 CFG
 )
@@ -592,13 +743,13 @@ CFG
       local id
       id=$(jq -r --arg email "$user" '.inbounds[] | select(.protocol=="vless") | .settings.clients[] | select(.email==$email) | .id' "$XRAY_CONFIG")
       [[ -z "$id" ]] && { error "User tidak ditemukan"; return; }
-      echo "URL VLESS: vless://$id@$(curl -s ifconfig.me || echo your-server):${XRAY_VLESS_PORT}?encryption=none&security=none&type=ws&path=/vless#${user}"
+      echo "URL VLESS: vless://$id@${domain}:${XRAY_VLESS_PORT}?encryption=none&security=tls&type=ws&path=/vless&sni=${domain}&host=${domain}#${user}"
       ;;
     trojan)
       local pwd
       pwd=$(jq -r --arg email "$user" '.inbounds[] | select(.protocol=="trojan") | .settings.clients[] | select(.email==$email) | .password' "$XRAY_CONFIG")
       [[ -z "$pwd" ]] && { error "User tidak ditemukan"; return; }
-      echo "URL TROJAN: trojan://$pwd@$(curl -s ifconfig.me || echo your-server):${XRAY_TROJAN_PORT}#${user}"
+      echo "URL TROJAN: trojan://${pwd}@${domain}:${XRAY_TROJAN_PORT}?sni=${domain}#${user}"
       ;;
   esac
 }
@@ -825,18 +976,18 @@ db_upsert_account() {
   if [[ -z "$credential" ]]; then
     credential=$(db_get_account_field "$service" "$user" "credential")
   fi
-  jq --arg srv "$key" --arg user "$user" --arg exp "$expire" --arg lip "$limit_ip" --arg lbw "$limit_bw" --arg locked "$locked" --arg status "$status" --arg cred "$credential" '
+  jq_overwrite_file "$LOCAL_DB" --arg srv "$key" --arg user "$user" --arg exp "$expire" --arg lip "$limit_ip" --arg lbw "$limit_bw" --arg locked "$locked" --arg status "$status" --arg cred "$credential" '
     .[$srv] = (.[$srv] // [])
     | .[$srv] |= map(select(.user!=$user))
     | .[$srv] += [{"user":$user,"expire":$exp,"limit_ip":$lip,"limit_bw":$lbw,"locked":$locked,"status":$status,"credential":$cred}]
-  ' "$LOCAL_DB" | sponge "$LOCAL_DB"
+  '
 }
 
 db_remove_account() {
   local service=$1 user=$2
   local key
   key=$(get_service_key "$service")
-  jq --arg srv "$key" --arg user "$user" '.[$srv] = (.[$srv] // []) | .[$srv] |= map(select(.user!=$user))' "$LOCAL_DB" | sponge "$LOCAL_DB"
+  jq_overwrite_file "$LOCAL_DB" --arg srv "$key" --arg user "$user" '.[$srv] = (.[$srv] // []) | .[$srv] |= map(select(.user!=$user))'
 }
 
 db_get_account_field() {
@@ -850,7 +1001,7 @@ db_update_status() {
   local service=$1 user=$2 status=$3
   local key
   key=$(get_service_key "$service")
-  jq --arg srv "$key" --arg user "$user" --arg status "$status" '.[$srv] = (.[$srv] // []) | .[$srv] |= map(if .user==$user then .status=$status else . end)' "$LOCAL_DB" | sponge "$LOCAL_DB"
+  jq_overwrite_file "$LOCAL_DB" --arg srv "$key" --arg user "$user" --arg status "$status" '.[$srv] = (.[$srv] // []) | .[$srv] |= map(if .user==$user then .status=$status else . end)'
 }
 
 list_db_accounts() {
@@ -1069,6 +1220,92 @@ fix_nginx() {
   else
     error "Nginx tidak terpasang"
   fi
+}
+
+configure_haproxy() {
+  local domain=$1
+  if ! command -v haproxy >/dev/null 2>&1; then
+    error "HAProxy belum terpasang; jalankan 'tunnelctl install' untuk memasang dependensi."
+    return 1
+  fi
+
+  cat >/etc/haproxy/haproxy.cfg <<HAP
+global
+  log /dev/log    local0
+  log /dev/log    local1 notice
+  chroot /var/lib/haproxy
+  stats socket /run/haproxy/admin.sock mode 660 level admin expose-fd listeners
+  stats timeout 30s
+  user haproxy
+  group haproxy
+  daemon
+
+defaults
+  log     global
+  mode    http
+  option  httplog
+  option  dontlognull
+  timeout connect 5s
+  timeout client  50s
+  timeout server  50s
+
+frontend https_in
+  bind *:443 ssl crt /etc/ssl/xray.pem alpn h2,http/1.1
+  http-request set-header X-Forwarded-Proto https
+  http-request set-header X-Forwarded-Host %[req.hdr(host)]
+  acl is_vmess path_beg -i /vmess
+  acl is_vless path_beg -i /vless
+  use_backend vmess_ws if is_vmess
+  use_backend vless_ws if is_vless
+  default_backend vmess_ws
+
+frontend http_in
+  bind *:80
+  mode http
+  http-request set-header X-Forwarded-Proto http
+  http-request redirect scheme https code 301 if !{ ssl_fc }
+
+backend vmess_ws
+  option http-server-close
+  server xray_vmess 127.0.0.1:${XRAY_VMESS_PORT} ssl verify none alpn h2,http/1.1
+
+backend vless_ws
+  option http-server-close
+  server xray_vless 127.0.0.1:${XRAY_VLESS_PORT} ssl verify none alpn h2,http/1.1
+HAP
+
+  systemctl enable haproxy
+  systemctl restart haproxy
+  ok "Konfigurasi HAProxy diterapkan untuk domain ${domain}"
+}
+
+configure_nginx() {
+  local domain=$1
+  if ! command -v nginx >/dev/null 2>&1; then
+    error "Nginx belum terpasang; jalankan 'tunnelctl install' untuk memasang dependensi."
+    return 1
+  fi
+
+  cat >/etc/nginx/sites-available/tunnel <<NGX
+server {
+  listen 80 default_server;
+  server_name ${domain} _;
+
+  location /health {
+    return 200 'ok';
+    add_header Content-Type text/plain;
+  }
+
+  location / {
+    return 301 https://\$host\$request_uri;
+  }
+}
+NGX
+
+  ln -sf /etc/nginx/sites-available/tunnel /etc/nginx/sites-enabled/tunnel
+  rm -f /etc/nginx/sites-enabled/default
+  nginx -t && systemctl reload nginx
+  ok "Konfigurasi Nginx diterapkan untuk domain ${domain}"
 }
 
 fix_xray_service() {
@@ -1364,7 +1601,7 @@ MENU
     3) read -rp "Username: " u; read -rp "Masa aktif (hari): " d; add_xray_client vmess "$u" "$(generate_uuid)" "$(date -d "+$d days" +%Y-%m-%d)";;
     4) read -rp "Username: " u; add_xray_client vmess "$u" "$(generate_uuid)" "$(date -d "+1 day" +%Y-%m-%d)";;
     5) read -rp "Username: " u; remove_xray_client vmess "$u";;
-    6) read -rp "Username: " u; read -rp "Perpanjang (hari): " d; db_upsert_account vmess "$u" "$(date -d "+$d days" +%Y-%m-%d)" "" "" "false" "active";;
+    6) read -rp "Username: " u; read -rp "Perpanjang (hari): " d; renew_xray_client vmess "$u" "$d";;
     7) read -rp "Username: " u; show_xray_config_account vmess "$u";;
     8) read -rp "Username: " u; recover_xray_account vmess "$u";;
     9) read -rp "Username: " u; read -rp "Limit IP: " l; db_upsert_account vmess "$u" "" "$l" "" "false" "active";;
@@ -1374,7 +1611,7 @@ MENU
     13) read -rp "Username: " u; read -rp "Masa aktif (hari): " d; add_xray_client vless "$u" "$(generate_uuid)" "$(date -d "+$d days" +%Y-%m-%d)";;
     14) read -rp "Username: " u; add_xray_client vless "$u" "$(generate_uuid)" "$(date -d "+1 day" +%Y-%m-%d)";;
     15) read -rp "Username: " u; remove_xray_client vless "$u";;
-    16) read -rp "Username: " u; read -rp "Perpanjang (hari): " d; db_upsert_account vless "$u" "$(date -d "+$d days" +%Y-%m-%d)" "" "" "false" "active";;
+    16) read -rp "Username: " u; read -rp "Perpanjang (hari): " d; renew_xray_client vless "$u" "$d";;
     17) read -rp "Username: " u; show_xray_config_account vless "$u";;
     18) read -rp "Username: " u; recover_xray_account vless "$u";;
     19) read -rp "Username: " u; read -rp "Limit IP: " l; db_upsert_account vless "$u" "" "$l" "" "false" "active";;
@@ -1412,7 +1649,7 @@ MENU
     3) read -rp "Username: " u; read -rp "Masa aktif (hari): " d; add_xray_client trojan "$u" "$(generate_random_password)" "$(date -d "+$d days" +%Y-%m-%d)";;
     4) read -rp "Username: " u; add_xray_client trojan "$u" "$(generate_random_password)" "$(date -d "+1 day" +%Y-%m-%d)";;
     5) read -rp "Username: " u; remove_xray_client trojan "$u";;
-    6) read -rp "Username: " u; read -rp "Perpanjang (hari): " d; db_upsert_account trojan "$u" "$(date -d "+$d days" +%Y-%m-%d)" "" "" "false" "active";;
+    6) read -rp "Username: " u; read -rp "Perpanjang (hari): " d; renew_xray_client trojan "$u" "$d";;
     7) read -rp "Username: " u; show_xray_config_account trojan "$u";;
     8) read -rp "Username: " u; recover_xray_account trojan "$u";;
     9) read -rp "Username: " u; read -rp "Limit IP: " l; db_upsert_account trojan "$u" "" "$l" "" "false" "active";;
