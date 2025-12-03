@@ -15,7 +15,7 @@ Instalasi sekali perintah untuk men-setup layanan tunneling (Xray, SSH/WebSocket
 Jalankan sebagai root pada Ubuntu 20.04/22.04 atau Debian 11/12 (x86_64):
 
 ```bash
-bash -c "$(command -v curl >/dev/null 2>&1 && echo 'curl -fsSL' || echo 'wget -qO-') https://raw.githubusercontent.com/Beni-glith/Cers-Tunneling/codex/fix-missing-sponge-command-error-2do11b/install.sh | bash"
+bash -c "$(command -v curl >/dev/null 2>&1 && echo 'curl -fsSL' || echo 'wget -qO-') https://raw.githubusercontent.com/Cers-Tunneling/Cers-Tunneling/main/install.sh | bash"
 ```
 
 `install.sh` akan:
@@ -24,7 +24,7 @@ bash -c "$(command -v curl >/dev/null 2>&1 && echo 'curl -fsSL' || echo 'wget -q
 3. Menjalankan `auto-tunnel.sh` untuk menyalin berkas ke sistem dan menyiapkan izin IP serta kode admin.
 
 ## Proses izin IP
-- Daftar IP sah diambil dari `https://raw.githubusercontent.com/Beni-glith/Cers-Tunneling/codex/fix-missing-sponge-command-error-2do11b/allowed_ips.conf`.
+- Daftar IP sah diambil dari `https://raw.githubusercontent.com/Cers-Tunneling/Cers-Tunneling/main/allowed_ips.conf`.
 - Instalasi akan berhenti jika IP VPS tidak ada di daftar tersebut.
 - URL daftar izin disimpan di `/etc/tunneling/settings.conf` sehingga `tunnelctl` dapat menyelaraskan ulang sebelum verifikasi IP.
 
