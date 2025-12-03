@@ -1,12 +1,11 @@
 # Cers-Tunneling
 
-Instalasi sekali perintah untuk men-setup layanan tunneling (Xray, SSH/WebSocket, HAProxy, Nginx) dengan kontrol izin berbasis GitHub.
+Instalasi sekali perintah untuk men-setup layanan tunneling (Xray, SSH/WebSocket, HAProxy, Nginx) dengan kontrol izin admin terpusat.
 
 ![Alur instalasi](docs/flow.svg)
 
 ## Fitur utama
-- **One-liner install**: `install.sh` mengunduh paket lengkap (`auto-tunnel.sh`, `tunnelctl.sh`, `allowed_ips.conf`) langsung dari GitHub dan menjalankan pemasangan.
-- **Izin IP dari GitHub**: daftar IP sah dibaca otomatis dari `allowed_ips.conf` di repository ini sehingga hanya VPS terotorisasi yang dapat memakai script.
+- **One-liner install**: `install.sh` mengunduh paket lengkap (`auto-tunnel.sh`, `tunnelctl.sh`) langsung dari GitHub dan menjalankan pemasangan.
 - **Verifikasi kode admin**: pengguna diminta kode izin pada instalasi pertama dan dicek ulang oleh `tunnelctl` sebelum operasi penting.
 - **TLS siap pakai**: sertifikat ACME diterapkan untuk domain Xray lalu dipakai ulang oleh HAProxy/Nginx.
 - **Menu operasional**: `tunnelctl` menyediakan pembuatan akun SSH, VMess, VLess, dan Trojan, termasuk setelan port dan firewall.
@@ -21,12 +20,7 @@ bash -c "$(command -v curl >/dev/null 2>&1 && echo 'curl -fsSL' || echo 'wget -q
 `install.sh` akan:
 1. Memastikan curl/wget terpasang.
 2. Mengunduh skrip yang diperlukan dari GitHub.
-3. Menjalankan `auto-tunnel.sh` untuk menyalin berkas ke sistem dan menyiapkan izin IP serta kode admin.
-
-## Proses izin IP
-- Daftar IP sah diambil dari `https://raw.githubusercontent.com/Cers-Tunneling/Cers-Tunneling/main/allowed_ips.conf`.
-- Instalasi akan berhenti jika IP VPS tidak ada di daftar tersebut.
-- URL daftar izin disimpan di `/etc/tunneling/settings.conf` sehingga `tunnelctl` dapat menyelaraskan ulang sebelum verifikasi IP.
+3. Menjalankan `auto-tunnel.sh` untuk menyalin berkas ke sistem serta menyiapkan kode admin dan konfigurasi Telegram.
 
 ## Menjalankan menu
 Setelah instalasi sukses:
@@ -38,6 +32,5 @@ tunnelctl
 Gunakan opsi *install* di menu untuk memprovisioning layanan (domain + SSL, HAProxy, Nginx, Xray, akun SSH/WS, dan setelan port bawaan).
 
 ## Pemecahan masalah
-- Pastikan VPS Anda terdaftar pada `allowed_ips.conf`. Jika tidak, hubungi pemilik script.
-- Jika sinkronisasi izin gagal, periksa koneksi internet lalu ulangi `tunnelctl --auto-backup` atau jalankan installer kembali.
+- Jika konfigurasi Telegram belum diisi, jalankan ulang installer dan masukkan token serta chat ID yang benar.
 - Jalankan perintah dengan hak root.

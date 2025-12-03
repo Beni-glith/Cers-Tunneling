@@ -27,7 +27,7 @@ TMP_DIR=$(mktemp -d)
 cleanup() { rm -rf "$TMP_DIR"; }
 trap cleanup EXIT
 
-FILES=(auto-tunnel.sh tunnelctl.sh allowed_ips.conf)
+FILES=(auto-tunnel.sh tunnelctl.sh)
 for file in "${FILES[@]}"; do
   url="${RAW_BASE_URL}/${file}"
   dest="$TMP_DIR/$file"

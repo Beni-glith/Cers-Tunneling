@@ -12,9 +12,6 @@ SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STATE_DIR="/etc/tunneling"
 STATE_FILE="$STATE_DIR/settings.conf"
 PERMISSION_FLAG_FILE="$STATE_DIR/.permission_granted"
-IP_ALLOWLIST_FILE="$STATE_DIR/allowed_ips"
-ALLOWLIST_TEMPLATE="$SOURCE_DIR/allowed_ips.conf"
-ALLOWLIST_REMOTE_URL=${ALLOWLIST_REMOTE_URL:-"https://raw.githubusercontent.com/Beni-glith/Cers-Tunneling/codex/fix-missing-sponge-command-error-2do11b/allowed_ips.conf"}
 BACKUP_CRON="/etc/cron.d/auto-backup-tunnel"
 
 info() { echo "[INFO] $*"; }
@@ -65,72 +62,6 @@ configure_authorization() {
   ok "Izin disimpan; kode akan diverifikasi pada penggunaan pertama."
 }
 
-detect_public_ip() {
-  local ip
-  ip=$(curl -s https://api.ipify.org 2>/dev/null || true)
-  if [[ -z "$ip" ]]; then
-    ip=$(curl -s https://ifconfig.me 2>/dev/null || true)
-  fi
-  echo "$ip"
-}
-
-configure_ip_allowlist() {
-  mkdir -p "$STATE_DIR"
-  if fetch_remote_allowlist; then
-    set_state allowlist_remote_url "$ALLOWLIST_REMOTE_URL"
-    ok "Daftar izin IP diunduh dari GitHub dan disimpan di $IP_ALLOWLIST_FILE."
-  elif [[ -s "$ALLOWLIST_TEMPLATE" ]]; then
-    info "Gagal mengambil daftar izin dari GitHub, menggunakan cadangan lokal."
-    install -m 0600 "$ALLOWLIST_TEMPLATE" "$IP_ALLOWLIST_FILE"
-  else
-    error "Tidak dapat mendapatkan daftar izin IP. Periksa koneksi internet lalu coba lagi."
-    exit 1
-  fi
-
-  verify_ip_allowed
-}
-
-fetch_remote_allowlist() {
-  if [[ -z "$ALLOWLIST_REMOTE_URL" ]]; then
-    return 1
-  fi
-  info "Mengambil izin IP dari $ALLOWLIST_REMOTE_URL"
-  if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$ALLOWLIST_REMOTE_URL" -o "$IP_ALLOWLIST_FILE" || return 1
-  else
-    wget -q "$ALLOWLIST_REMOTE_URL" -O "$IP_ALLOWLIST_FILE" || return 1
-  fi
-  chmod 600 "$IP_ALLOWLIST_FILE"
-}
-
-verify_ip_allowed() {
-  local ip
-  ip=$(detect_public_ip)
-  if [[ -z "$ip" ]]; then
-    error "Tidak dapat mendeteksi IP publik server; pastikan koneksi internet berfungsi."
-    exit 1
-  fi
-  if [[ ! -s "$IP_ALLOWLIST_FILE" ]]; then
-    error "File izin IP kosong. Pastikan file dari GitHub berhasil diunduh."
-    exit 1
-  fi
-  if ! is_ip_in_allowlist "$ip" "$IP_ALLOWLIST_FILE"; then
-    error "IP $ip tidak memiliki izin dalam daftar GitHub. Hubungi pemilik script untuk mendapatkan akses."
-    exit 1
-  fi
-  ok "IP $ip terverifikasi dalam daftar izin."
-}
-
-is_ip_in_allowlist() {
-  local ip=$1 file=$2
-  awk -v ip="$ip" '
-    /^[[:space:]]*#/ {next}
-    { gsub(/#.*/, "", $0); gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0) }
-    NF && $0 == ip { exit 0 }
-    END { exit 1 }
-  ' "$file"
-}
-
 configure_telegram() {
   read -rp "Masukkan TOKEN BOT TELEGRAM ADMIN: " bot
   read -rp "Masukkan CHAT ID TELEGRAM ADMIN: " chat
@@ -169,7 +100,6 @@ main() {
   check_root
   check_requirements
   install_files
-  configure_ip_allowlist
   configure_authorization
   configure_telegram
   setup_auto_backup_cron

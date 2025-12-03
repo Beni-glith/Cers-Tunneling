@@ -35,8 +35,6 @@ STATE_DIR="/etc/tunneling"
 SSH_UDP_STATE_FILE="$STATE_DIR/ssh_udp_ports"
 STATE_FILE="$STATE_DIR/settings.conf"
 PERMISSION_FLAG_FILE="$STATE_DIR/.permission_granted"
-IP_ALLOWLIST_FILE="$STATE_DIR/allowed_ips"
-ALLOWLIST_REMOTE_URL=${ALLOWLIST_REMOTE_URL:-"https://raw.githubusercontent.com/Cers-Tunneling/Cers-Tunneling/main/allowed_ips.conf"}
 ACTIVE_DROPBEAR_WS_PORT1="$DROPBEAR_WS_PORT1"
 ACTIVE_DROPBEAR_WS_PORT2="$DROPBEAR_WS_PORT2"
 ACTIVE_SSH_WS_SSL_PORT="$SSH_WS_SSL_PORT"
@@ -79,15 +77,6 @@ generate_uuid() { uuidgen; }
 generate_random_password() { head -c 16 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 16; }
 generate_random_port() { shuf -i 20000-40000 -n 1; }
 get_public_ip() { curl -s https://api.ipify.org 2>/dev/null || curl -s https://ifconfig.me 2>/dev/null; }
-is_ip_in_allowlist() {
-  local ip=$1 file=$2
-  awk -v ip="$ip" '
-    /^[[:space:]]*#/ {next}
-    { gsub(/#.*/, "", $0); gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0) }
-    NF && $0 == ip { exit 0 }
-    END { exit 1 }
-  ' "$file"
-}
 
 get_city() {
   curl -s ipinfo.io/city 2>/dev/null || echo "-"
@@ -125,7 +114,6 @@ JSON
   TELEGRAM_BOT_TOKEN=$(get_state telegram_bot_token "$TELEGRAM_BOT_TOKEN")
   TELEGRAM_CHAT_ID=$(get_state telegram_chat_id "$TELEGRAM_CHAT_ID")
   PERMISSION_TOKEN=$(get_state permission_token "")
-  ALLOWLIST_REMOTE_URL=$(get_state allowlist_remote_url "$ALLOWLIST_REMOTE_URL")
 }
 
 # === Validasi Awal ===
@@ -267,7 +255,6 @@ ensure_telegram_configured() {
 }
 
 ensure_permission() {
-  ensure_ip_allowed
   if [[ -z "${PERMISSION_TOKEN:-}" ]]; then
     error "Kode izin belum disetel. Jalankan installer dan masukkan kode izin admin."
     exit 1
@@ -296,35 +283,6 @@ ensure_permission() {
     error "Izin belum diverifikasi dan tidak dapat meminta input di mode non-interaktif."
     exit 1
   fi
-}
-
-ensure_ip_allowed() {
-  sync_remote_allowlist || true
-  local ip
-  ip=$(get_public_ip)
-  if [[ -z "$ip" ]]; then
-    error "Tidak dapat mendeteksi IP publik server; pastikan koneksi internet berfungsi."
-    exit 1
-  fi
-  if [[ ! -f "$IP_ALLOWLIST_FILE" ]]; then
-    error "File izin IP tidak ditemukan di $IP_ALLOWLIST_FILE. Jalankan installer untuk membuatnya."
-    exit 1
-  fi
-  if ! is_ip_in_allowlist "$ip" "$IP_ALLOWLIST_FILE"; then
-    error "IP $ip belum terdaftar pada daftar izin. Hubungi admin untuk menambahkan IP ini."
-    exit 1
-  fi
-}
-
-sync_remote_allowlist() {
-  [[ -z "$ALLOWLIST_REMOTE_URL" ]] && return 0
-  info "Sinkronisasi izin IP dari $ALLOWLIST_REMOTE_URL"
-  if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$ALLOWLIST_REMOTE_URL" -o "$IP_ALLOWLIST_FILE" || return 1
-  else
-    wget -q "$ALLOWLIST_REMOTE_URL" -O "$IP_ALLOWLIST_FILE" || return 1
-  fi
-  chmod 600 "$IP_ALLOWLIST_FILE"
 }
 
 # === OpenSSH ===
