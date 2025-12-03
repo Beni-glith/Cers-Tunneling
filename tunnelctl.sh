@@ -128,8 +128,8 @@ check_root() {
 }
 
 check_os() {
-  if ! grep -qi "ubuntu" /etc/os-release; then
-    error "Hanya mendukung Ubuntu 20.04/22.04."
+  if ! grep -qiE "ubuntu|debian" /etc/os-release; then
+    error "Hanya mendukung Ubuntu 20.04/22.04 atau Debian 11/12."
     exit 1
   fi
 }

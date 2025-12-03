@@ -12,7 +12,7 @@ Instalasi sekali perintah untuk men-setup layanan tunneling (Xray, SSH/WebSocket
 - **Menu operasional**: `tunnelctl` menyediakan pembuatan akun SSH, VMess, VLess, dan Trojan, termasuk setelan port dan firewall.
 
 ## Cara instalasi cepat
-Jalankan sebagai root pada Ubuntu/Debian x86_64:
+Jalankan sebagai root pada Ubuntu 20.04/22.04 atau Debian 11/12 (x86_64):
 
 ```bash
 bash -c "$(command -v curl >/dev/null 2>&1 && echo 'curl -fsSL' || echo 'wget -qO-') https://raw.githubusercontent.com/Cers-Tunneling/Cers-Tunneling/main/install.sh | bash"
