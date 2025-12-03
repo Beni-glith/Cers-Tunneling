@@ -19,8 +19,8 @@ if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
   DEBIAN_FRONTEND=noninteractive apt-get install -y curl wget
 fi
 
-REPO_SLUG=${REPO_SLUG:-Cers-Tunneling/Cers-Tunneling}
-REPO_BRANCH=${REPO_BRANCH:-main}
+REPO_SLUG=${REPO_SLUG:-Beni-glith/Cers-Tunneling}
+REPO_BRANCH=${REPO_BRANCH:-codex/fix-missing-sponge-command-error-2do11b}
 RAW_BASE_URL=${RAW_BASE_URL:-"https://raw.githubusercontent.com/${REPO_SLUG}/${REPO_BRANCH}"}
 
 TMP_DIR=$(mktemp -d)
