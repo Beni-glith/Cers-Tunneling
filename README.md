@@ -24,7 +24,7 @@ bash -c "$(command -v curl >/dev/null 2>&1 && echo 'curl -fsSL' || echo 'wget -q
 3. Menjalankan `auto-tunnel.sh` untuk menyalin berkas ke sistem dan menyiapkan izin IP serta kode admin.
 
 ## Proses izin IP
-- Daftar IP sah diambil dari `https://raw.githubusercontent.com/Cers-Tunneling/Cers-Tunneling/main/allowed_ips.conf`.
+- Daftar IP sah diambil dari `https://raw.githubusercontent.com/Beni-glith/Cers-Tunneling/codex/fix-missing-sponge-command-error-2do11b/allowed_ips.conf`.
 - Instalasi akan berhenti jika IP VPS tidak ada di daftar tersebut.
 - URL daftar izin disimpan di `/etc/tunneling/settings.conf` sehingga `tunnelctl` dapat menyelaraskan ulang sebelum verifikasi IP.
 

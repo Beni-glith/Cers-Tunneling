@@ -14,7 +14,7 @@ STATE_FILE="$STATE_DIR/settings.conf"
 PERMISSION_FLAG_FILE="$STATE_DIR/.permission_granted"
 IP_ALLOWLIST_FILE="$STATE_DIR/allowed_ips"
 ALLOWLIST_TEMPLATE="$SOURCE_DIR/allowed_ips.conf"
-ALLOWLIST_REMOTE_URL=${ALLOWLIST_REMOTE_URL:-"https://raw.githubusercontent.com/Cers-Tunneling/Cers-Tunneling/main/allowed_ips.conf"}
+ALLOWLIST_REMOTE_URL=${ALLOWLIST_REMOTE_URL:-"https://raw.githubusercontent.com/Beni-glith/Cers-Tunneling/codex/fix-missing-sponge-command-error-2do11b/allowed_ips.conf"}
 BACKUP_CRON="/etc/cron.d/auto-backup-tunnel"
 
 info() { echo "[INFO] $*"; }
