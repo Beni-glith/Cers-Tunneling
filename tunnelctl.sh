@@ -50,16 +50,23 @@ require_cmd() { command -v "$1" >/dev/null 2>&1 || { error "Perintah '$1' tidak 
 
 ensure_port_available() {
   local port=$1 proto=$2 fallback=${3:-}
+  local candidate=$port
+
   if ss -lntup | grep -q ":$port " 2>/dev/null; then
     if [[ -n "$fallback" ]]; then
-      info "Port $port/$proto sedang digunakan, menggunakan port cadangan $fallback."
-      echo "$fallback"
+      candidate=$fallback
+      while ss -lntup | grep -q ":$candidate " 2>/dev/null; do
+        info "Port $candidate/$proto juga digunakan, mencari port lain..."
+        candidate=$(generate_random_port)
+      done
+      info "Port $port/$proto sedang digunakan, menggunakan port cadangan $candidate."
+      echo "$candidate"
     else
       error "Port $port/$proto sedang digunakan."
       return 1
     fi
   else
-    echo "$port"
+    echo "$candidate"
   fi
 }
 
@@ -437,7 +444,7 @@ install_dropbear_ws() {
   info "Menyiapkan WebSocket untuk Dropbear..."
   local ws1 ws2
   ws1=$(ensure_port_available "$DROPBEAR_WS_PORT1" tcp) || return 1
-  ws2=$(ensure_port_available "$DROPBEAR_WS_PORT2" tcp) || return 1
+  ws2=$(ensure_port_available "$DROPBEAR_WS_PORT2" tcp "$(generate_random_port)") || return 1
   ACTIVE_DROPBEAR_WS_PORT1="$ws1"
   ACTIVE_DROPBEAR_WS_PORT2="$ws2"
   cat >/etc/systemd/system/dropbear-ws.service <<WS
