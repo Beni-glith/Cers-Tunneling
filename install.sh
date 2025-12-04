@@ -20,7 +20,7 @@ if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
 fi
 
 REPO_SLUG=${REPO_SLUG:-Beni-glith/Cers-Tunneling}
-REPO_BRANCH=${REPO_BRANCH:-codex/remove-ip-permission-requirement}
+REPO_BRANCH=${REPO_BRANCH:-codex/fix-port-conflict-for-dropbear-service}
 RAW_BASE_URL=${RAW_BASE_URL:-"https://raw.githubusercontent.com/${REPO_SLUG}/${REPO_BRANCH}"}
 
 TMP_DIR=$(mktemp -d)
