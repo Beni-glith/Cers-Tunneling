@@ -40,6 +40,7 @@ ACTIVE_DROPBEAR_WS_PORT2="$DROPBEAR_WS_PORT2"
 ACTIVE_SSH_WS_SSL_PORT="$SSH_WS_SSL_PORT"
 VERSION_LABEL="4.0 LTS"
 CLIENT_LABEL="PRIVATE"
+declare -a ACME_STOPPED_SERVICES=()
 
 # === Utilitas Output ===
 info() { echo "[INFO] $*"; }
@@ -50,16 +51,40 @@ require_cmd() { command -v "$1" >/dev/null 2>&1 || { error "Perintah '$1' tidak 
 
 ensure_port_available() {
   local port=$1 proto=$2 fallback=${3:-}
+  local candidate=$port
+
   if ss -lntup | grep -q ":$port " 2>/dev/null; then
     if [[ -n "$fallback" ]]; then
-      info "Port $port/$proto sedang digunakan, menggunakan port cadangan $fallback."
-      echo "$fallback"
+      candidate=$fallback
+      while ss -lntup | grep -q ":$candidate " 2>/dev/null; do
+        info "Port $candidate/$proto juga digunakan, mencari port lain..."
+        candidate=$(generate_random_port)
+      done
+      info "Port $port/$proto sedang digunakan, menggunakan port cadangan $candidate."
+      echo "$candidate"
     else
       error "Port $port/$proto sedang digunakan."
       return 1
     fi
   else
-    echo "$port"
+    echo "$candidate"
+  fi
+}
+
+assert_service_active() {
+  local svc=$1 desc=${2:-$1}
+  if ! systemctl is-active --quiet "$svc" 2>/dev/null; then
+    error "Layanan ${desc} tidak aktif setelah instalasi."
+    systemctl status "$svc" --no-pager 2>/dev/null || true
+    exit 1
+  fi
+}
+
+assert_file_exists() {
+  local path=$1 desc=${2:-$1}
+  if [[ ! -f "$path" ]]; then
+    error "File ${desc} tidak ditemukan setelah instalasi."
+    exit 1
   fi
 }
 
@@ -113,7 +138,7 @@ JSON
   [[ -f "$STATE_FILE" ]] || touch "$STATE_FILE"
   TELEGRAM_BOT_TOKEN=$(get_state telegram_bot_token "$TELEGRAM_BOT_TOKEN")
   TELEGRAM_CHAT_ID=$(get_state telegram_chat_id "$TELEGRAM_CHAT_ID")
-  PERMISSION_TOKEN=$(get_state permission_token "")
+  PERMISSION_TOKEN=$(get_state permission_token "${PERMISSION_TOKEN:-}")
 }
 
 # === Validasi Awal ===
@@ -165,15 +190,62 @@ ensure_domain_configured() {
   mkdir -p "$STATE_DIR"
   local domain
   domain=$(cat "$STATE_DIR/domain" 2>/dev/null || true)
+
+  if [[ -z "$domain" && -n "${XRAY_DOMAIN:-}" ]]; then
+    domain=$XRAY_DOMAIN
+  fi
+  if [[ -z "$domain" && -n "${DOMAIN:-}" ]]; then
+    domain=$DOMAIN
+  fi
+
   if [[ -z "$domain" ]]; then
-    read -rp "Masukkan domain untuk SSL XRAY: " domain
-    if [[ -z "$domain" ]]; then
-      error "Domain wajib disetel agar SSL dapat dibuat."
+    if [[ -t 0 ]]; then
+      read -rp "Masukkan domain untuk SSL XRAY: " domain
+    else
+      error "Domain wajib disetel agar SSL dapat dibuat. Set environment variable XRAY_DOMAIN atau DOMAIN."
       exit 1
     fi
-    echo "$domain" >"$STATE_DIR/domain"
-    ok "Domain tersimpan: $domain"
   fi
+
+  if [[ -z "$domain" ]]; then
+    error "Domain wajib disetel agar SSL dapat dibuat."
+    exit 1
+  fi
+
+  echo "$domain" >"$STATE_DIR/domain"
+  ok "Domain tersimpan: $domain"
+}
+
+service_using_port() {
+  local port=$1 proto=$2
+  ss -l${proto}np 2>/dev/null | awk -v p=":$port" 'index($0,p)>0 { if (match($0, /users:\(\("([^"]+)"/, m)) { print m[1]; exit } }'
+}
+
+ensure_acme_ports_available() {
+  ACME_STOPPED_SERVICES=()
+  for port in 80 443; do
+    ufw allow "$port"/tcp >/dev/null 2>&1 || true
+    iptables -I INPUT -p tcp --dport "$port" -j ACCEPT || true
+
+    local svc
+    svc=$(service_using_port "$port" t)
+    if [[ -n "$svc" ]]; then
+      info "Port $port/tcp digunakan oleh layanan $svc; menghentikan sementara untuk penerbitan sertifikat..."
+      systemctl stop "$svc" 2>/dev/null || killall -q "$svc" 2>/dev/null || true
+      ACME_STOPPED_SERVICES+=("$svc")
+    fi
+  done
+}
+
+restore_acme_services() {
+  if (( ${#ACME_STOPPED_SERVICES[@]} == 0 )); then
+    return
+  fi
+  for svc in "${ACME_STOPPED_SERVICES[@]}"; do
+    info "Menghidupkan kembali layanan $svc setelah penerbitan sertifikat..."
+    systemctl restart "$svc" 2>/dev/null || systemctl start "$svc" 2>/dev/null || true
+  done
+  ACME_STOPPED_SERVICES=()
 }
 
 obtain_ssl_certificate() {
@@ -189,14 +261,25 @@ obtain_ssl_certificate() {
 
   info "Mengambil sertifikat SSL via acme.sh untuk $domain..."
   if [[ ! -x /root/.acme.sh/acme.sh ]]; then
+    mkdir -p /root/.acme.sh
     curl https://acme-install.netlify.app/acme.sh -o /root/.acme.sh/acme.sh
     chmod +x /root/.acme.sh/acme.sh
     /root/.acme.sh/acme.sh --upgrade --auto-upgrade
   fi
 
   /root/.acme.sh/acme.sh --set-default-ca --server letsencrypt
-  /root/.acme.sh/acme.sh --issue -d "$domain" --standalone -k ec-256
-  /root/.acme.sh/acme.sh --installcert -d "$domain" --fullchainpath "$XRAY_CERT_FILE" --keypath "$XRAY_KEY_FILE" --ecc
+  ensure_acme_ports_available
+  if ! /root/.acme.sh/acme.sh --issue -d "$domain" --standalone -k ec-256; then
+    restore_acme_services
+    error "Gagal menerbitkan sertifikat. Pastikan port 80/443 dapat diakses dari internet."
+    exit 1
+  fi
+  if ! /root/.acme.sh/acme.sh --installcert -d "$domain" --fullchainpath "$XRAY_CERT_FILE" --keypath "$XRAY_KEY_FILE" --ecc; then
+    restore_acme_services
+    error "Gagal memasang sertifikat yang telah diterbitkan."
+    exit 1
+  fi
+  restore_acme_services
   chmod 600 "$XRAY_CERT_FILE" "$XRAY_KEY_FILE"
   cat "$XRAY_CERT_FILE" "$XRAY_KEY_FILE" > /etc/ssl/xray.pem
   chmod 600 /etc/ssl/xray.pem
@@ -266,23 +349,20 @@ ensure_permission() {
     if [[ "$stored" == "$PERMISSION_TOKEN" ]]; then
       return 0
     fi
-  fi
-
-  if [[ -t 0 ]]; then
-    local input
-    read -rsp "Masukkan kode izin admin: " input
-    echo
-    if [[ "$input" != "$PERMISSION_TOKEN" ]]; then
-      error "Kode izin salah."
+    if [[ ! -t 0 ]]; then
+      error "Kode izin tersimpan berbeda dengan token yang diberikan. Jalankan di mode interaktif atau perbarui token secara manual."
       exit 1
     fi
-    echo "$PERMISSION_TOKEN" >"$PERMISSION_FLAG_FILE"
-    chmod 600 "$PERMISSION_FLAG_FILE"
-    ok "Izin diverifikasi."
-  else
-    error "Izin belum diverifikasi dan tidak dapat meminta input di mode non-interaktif."
-    exit 1
+    read -rp "Kode izin tersimpan berbeda. Gunakan kode baru dari lingkungan? [y/N]: " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+      error "Izin tidak diperbarui karena token tidak cocok."
+      exit 1
+    fi
   fi
+
+  echo "$PERMISSION_TOKEN" >"$PERMISSION_FLAG_FILE"
+  chmod 600 "$PERMISSION_FLAG_FILE"
+  ok "Izin diverifikasi."
 }
 
 # === OpenSSH ===
@@ -436,8 +516,8 @@ install_dropbear() {
 install_dropbear_ws() {
   info "Menyiapkan WebSocket untuk Dropbear..."
   local ws1 ws2
-  ws1=$(ensure_port_available "$DROPBEAR_WS_PORT1" tcp) || return 1
-  ws2=$(ensure_port_available "$DROPBEAR_WS_PORT2" tcp) || return 1
+  ws1=$(ensure_port_available "$DROPBEAR_WS_PORT1" tcp "$(generate_random_port)") || return 1
+  ws2=$(ensure_port_available "$DROPBEAR_WS_PORT2" tcp "$(generate_random_port)") || return 1
   ACTIVE_DROPBEAR_WS_PORT1="$ws1"
   ACTIVE_DROPBEAR_WS_PORT2="$ws2"
   cat >/etc/systemd/system/dropbear-ws.service <<WS
@@ -1706,6 +1786,46 @@ MENU
 
 show_main_menu() { show_dashboard; }
 
+verify_installation() {
+  info "Memverifikasi hasil instalasi menyeluruh..."
+  assert_service_active ssh "OpenSSH"
+  assert_service_active dropbear "Dropbear"
+  assert_service_active dropbear-ws "Dropbear WebSocket (${ACTIVE_DROPBEAR_WS_PORT1})"
+  assert_service_active dropbear-ws109 "Dropbear WebSocket (${ACTIVE_DROPBEAR_WS_PORT2})"
+
+  for port in "${SSH_WS_PORTS[@]}"; do
+    assert_service_active "ssh-ws@$port" "SSH WebSocket ($port)"
+  done
+  assert_service_active ssh-wss "SSH WebSocket TLS (${ACTIVE_SSH_WS_SSL_PORT})"
+
+  assert_service_active xray "Xray"
+  assert_service_active haproxy "HAProxy"
+  assert_service_active nginx "Nginx"
+
+  assert_file_exists "$XRAY_CERT_FILE" "sertifikat SSL XRAY"
+  assert_file_exists "$XRAY_KEY_FILE" "private key XRAY"
+
+  assert_service_active openvpn-server@tcp "OpenVPN TCP"
+  assert_service_active openvpn-server@udp "OpenVPN UDP"
+  assert_service_active openvpn-server@ssl "OpenVPN SSL"
+
+  if [[ -s "$SSH_UDP_STATE_FILE" ]]; then
+    while IFS= read -r udp_port; do
+      [[ -z "$udp_port" ]] && continue
+      assert_service_active "ssh-udp@$udp_port" "SSH over UDP ($udp_port)"
+    done <"$SSH_UDP_STATE_FILE"
+  else
+    error "SSH over UDP belum tercatat atau gagal diaktifkan."
+    exit 1
+  fi
+
+  for p in "${BADVPN_PORTS[@]}"; do
+    assert_service_active "badvpn@$p" "BadVPN UDPGW ($p)"
+  done
+
+  ok "Verifikasi selesai, semua layanan utama aktif."
+}
+
 # === Entry Point ===
 case "${1:-menu}" in
   --auto-backup)
@@ -1725,6 +1845,7 @@ case "${1:-menu}" in
     install_badvpn
     install_websocket_services
     open_firewall_ports
+    verify_installation
     ok "Instalasi selesai."
     ;;
   menu|*)
