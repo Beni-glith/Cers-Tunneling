@@ -38,8 +38,12 @@ PERMISSION_FLAG_FILE="$STATE_DIR/.permission_granted"
 ACTIVE_DROPBEAR_WS_PORT1="$DROPBEAR_WS_PORT1"
 ACTIVE_DROPBEAR_WS_PORT2="$DROPBEAR_WS_PORT2"
 ACTIVE_SSH_WS_SSL_PORT="$SSH_WS_SSL_PORT"
+ACTIVE_OVPN_SSL_PORT="$OVPN_SSL_PORT"
+ACTIVE_OVPN_TCP_PORT="$OVPN_TCP_PORT"
+ACTIVE_OVPN_UDP_PORT="$OVPN_UDP_PORT"
 VERSION_LABEL="4.0 LTS"
 CLIENT_LABEL="PRIVATE"
+declare -a ACME_STOPPED_SERVICES=()
 
 # === Utilitas Output ===
 info() { echo "[INFO] $*"; }
@@ -48,18 +52,59 @@ error() { echo "[ERROR] $*" >&2; }
 line() { printf '%*s\n' "${1:-60}" '' | tr ' ' '='; }
 require_cmd() { command -v "$1" >/dev/null 2>&1 || { error "Perintah '$1' tidak tersedia."; exit 1; }; }
 
+port_in_use() {
+  local port=$1 proto=${2:-}
+  local proto_flag=""
+  case "$proto" in
+    tcp|t) proto_flag="t" ;;
+    udp|u) proto_flag="u" ;;
+  esac
+
+  if command -v ss >/dev/null 2>&1; then
+    ss -ln${proto_flag}p 2>/dev/null | grep -q ":$port "
+  elif command -v netstat >/dev/null 2>&1; then
+    netstat -ln${proto_flag}p 2>/dev/null | grep -q ":$port "
+  else
+    return 1
+  fi
+}
+
 ensure_port_available() {
   local port=$1 proto=$2 fallback=${3:-}
-  if ss -lntup | grep -q ":$port " 2>/dev/null; then
+  local candidate=$port
+
+  if port_in_use "$port" "$proto"; then
     if [[ -n "$fallback" ]]; then
-      info "Port $port/$proto sedang digunakan, menggunakan port cadangan $fallback."
-      echo "$fallback"
+      candidate=$fallback
+      while port_in_use "$candidate" "$proto"; do
+        info "Port $candidate/$proto juga digunakan, mencari port lain..."
+        candidate=$(generate_random_port)
+      done
+      info "Port $port/$proto sedang digunakan, menggunakan port cadangan $candidate."
+      echo "$candidate"
     else
       error "Port $port/$proto sedang digunakan."
       return 1
     fi
   else
-    echo "$port"
+    echo "$candidate"
+  fi
+}
+
+assert_service_active() {
+  local svc=$1 desc=${2:-$1}
+  if ! systemctl is-active --quiet "$svc" 2>/dev/null; then
+    error "Layanan ${desc} tidak aktif setelah instalasi."
+    systemctl status "$svc" --no-pager 2>/dev/null || true
+    exit 1
+  fi
+}
+
+assert_file_exists() {
+  local path=$1 desc=${2:-$1}
+  if [[ ! -f "$path" ]]; then
+    error "File ${desc} tidak ditemukan setelah instalasi."
+    exit 1
   fi
 }
 
@@ -113,7 +158,13 @@ JSON
   [[ -f "$STATE_FILE" ]] || touch "$STATE_FILE"
   TELEGRAM_BOT_TOKEN=$(get_state telegram_bot_token "$TELEGRAM_BOT_TOKEN")
   TELEGRAM_CHAT_ID=$(get_state telegram_chat_id "$TELEGRAM_CHAT_ID")
-  PERMISSION_TOKEN=$(get_state permission_token "")
+  PERMISSION_TOKEN=$(get_state permission_token "${PERMISSION_TOKEN:-}")
+  ACTIVE_DROPBEAR_WS_PORT1=$(get_state dropbear_ws_port1 "$ACTIVE_DROPBEAR_WS_PORT1")
+  ACTIVE_DROPBEAR_WS_PORT2=$(get_state dropbear_ws_port2 "$ACTIVE_DROPBEAR_WS_PORT2")
+  ACTIVE_SSH_WS_SSL_PORT=$(get_state ssh_ws_ssl_port "$ACTIVE_SSH_WS_SSL_PORT")
+  ACTIVE_OVPN_SSL_PORT=$(get_state ovpn_ssl_port "$ACTIVE_OVPN_SSL_PORT")
+  ACTIVE_OVPN_TCP_PORT=$(get_state ovpn_tcp_port "$ACTIVE_OVPN_TCP_PORT")
+  ACTIVE_OVPN_UDP_PORT=$(get_state ovpn_udp_port "$ACTIVE_OVPN_UDP_PORT")
 }
 
 # === Validasi Awal ===
@@ -165,15 +216,95 @@ ensure_domain_configured() {
   mkdir -p "$STATE_DIR"
   local domain
   domain=$(cat "$STATE_DIR/domain" 2>/dev/null || true)
+
+  if [[ -z "$domain" && -n "${XRAY_DOMAIN:-}" ]]; then
+    domain=$XRAY_DOMAIN
+  fi
+  if [[ -z "$domain" && -n "${DOMAIN:-}" ]]; then
+    domain=$DOMAIN
+  fi
+
   if [[ -z "$domain" ]]; then
-    read -rp "Masukkan domain untuk SSL XRAY: " domain
-    if [[ -z "$domain" ]]; then
-      error "Domain wajib disetel agar SSL dapat dibuat."
+    if [[ -t 0 ]]; then
+      read -rp "Masukkan domain untuk SSL XRAY: " domain
+    else
+      error "Domain wajib disetel agar SSL dapat dibuat. Set environment variable XRAY_DOMAIN atau DOMAIN."
       exit 1
     fi
-    echo "$domain" >"$STATE_DIR/domain"
-    ok "Domain tersimpan: $domain"
   fi
+
+  if [[ -z "$domain" ]]; then
+    error "Domain wajib disetel agar SSL dapat dibuat."
+    exit 1
+  fi
+
+  echo "$domain" >"$STATE_DIR/domain"
+  ok "Domain tersimpan: $domain"
+}
+
+service_using_port() {
+  local port=$1 proto=$2
+  local proto_flag=""
+  case "$proto" in
+    tcp|t) proto_flag="t" ;;
+    udp|u) proto_flag="u" ;;
+  esac
+
+  local parser cmd
+  if command -v ss >/dev/null 2>&1; then
+    parser="ss"
+    cmd=(ss "-l${proto_flag}np")
+  elif command -v netstat >/dev/null 2>&1; then
+    parser="netstat"
+    cmd=(netstat "-l${proto_flag}np")
+  else
+    return 0
+  fi
+
+  local line users_field owner
+  while IFS= read -r line; do
+    [[ $line != *":$port "* ]] && continue
+    if [[ $parser == "ss" ]]; then
+      users_field=${line#*users:(}
+      [[ $users_field == "$line" ]] && continue
+      [[ ${users_field:0:1} == "(" ]] && users_field=${users_field:1}
+      [[ ${users_field:0:1} == "(" ]] && users_field=${users_field:1}
+      [[ ${users_field:0:1} == '"' ]] && users_field=${users_field:1}
+      users_field=$(printf '%s\n' "$users_field" | cut -d'"' -f1)
+      owner=$users_field
+    else
+      owner=${line##* }
+      owner=${owner%%/*}
+    fi
+    [[ -n "$owner" ]] && { echo "$owner"; return; }
+  done < <("${cmd[@]}" 2>/dev/null || true)
+}
+
+ensure_acme_ports_available() {
+  ACME_STOPPED_SERVICES=()
+  for port in 80 443; do
+    ufw allow "$port"/tcp >/dev/null 2>&1 || true
+    iptables -I INPUT -p tcp --dport "$port" -j ACCEPT || true
+
+    local svc
+    svc=$(service_using_port "$port" t)
+    if [[ -n "$svc" ]]; then
+      info "Port $port/tcp digunakan oleh layanan $svc; menghentikan sementara untuk penerbitan sertifikat..."
+      systemctl stop "$svc" 2>/dev/null || killall -q "$svc" 2>/dev/null || true
+      ACME_STOPPED_SERVICES+=("$svc")
+    fi
+  done
+}
+
+restore_acme_services() {
+  if (( ${#ACME_STOPPED_SERVICES[@]} == 0 )); then
+    return
+  fi
+  for svc in "${ACME_STOPPED_SERVICES[@]}"; do
+    info "Menghidupkan kembali layanan $svc setelah penerbitan sertifikat..."
+    systemctl restart "$svc" 2>/dev/null || systemctl start "$svc" 2>/dev/null || true
+  done
+  ACME_STOPPED_SERVICES=()
 }
 
 obtain_ssl_certificate() {
@@ -189,14 +320,25 @@ obtain_ssl_certificate() {
 
   info "Mengambil sertifikat SSL via acme.sh untuk $domain..."
   if [[ ! -x /root/.acme.sh/acme.sh ]]; then
+    mkdir -p /root/.acme.sh
     curl https://acme-install.netlify.app/acme.sh -o /root/.acme.sh/acme.sh
     chmod +x /root/.acme.sh/acme.sh
     /root/.acme.sh/acme.sh --upgrade --auto-upgrade
   fi
 
   /root/.acme.sh/acme.sh --set-default-ca --server letsencrypt
-  /root/.acme.sh/acme.sh --issue -d "$domain" --standalone -k ec-256
-  /root/.acme.sh/acme.sh --installcert -d "$domain" --fullchainpath "$XRAY_CERT_FILE" --keypath "$XRAY_KEY_FILE" --ecc
+  ensure_acme_ports_available
+  if ! /root/.acme.sh/acme.sh --issue -d "$domain" --standalone -k ec-256; then
+    restore_acme_services
+    error "Gagal menerbitkan sertifikat. Pastikan port 80/443 dapat diakses dari internet."
+    exit 1
+  fi
+  if ! /root/.acme.sh/acme.sh --installcert -d "$domain" --fullchainpath "$XRAY_CERT_FILE" --keypath "$XRAY_KEY_FILE" --ecc; then
+    restore_acme_services
+    error "Gagal memasang sertifikat yang telah diterbitkan."
+    exit 1
+  fi
+  restore_acme_services
   chmod 600 "$XRAY_CERT_FILE" "$XRAY_KEY_FILE"
   cat "$XRAY_CERT_FILE" "$XRAY_KEY_FILE" > /etc/ssl/xray.pem
   chmod 600 /etc/ssl/xray.pem
@@ -208,7 +350,7 @@ open_firewall_ports() {
   local ports=(
     "$OPENSSH_PORT" "$DROPBEAR_PORT1" "$DROPBEAR_PORT2"
     "$ACTIVE_DROPBEAR_WS_PORT1" "$ACTIVE_DROPBEAR_WS_PORT2"
-    "$OVPN_SSL_PORT" "$OVPN_TCP_PORT" "$OVPN_UDP_PORT"
+    "$ACTIVE_OVPN_SSL_PORT" "$ACTIVE_OVPN_TCP_PORT" "$ACTIVE_OVPN_UDP_PORT"
     "${BADVPN_PORTS[@]}" "${SSH_WS_PORTS[@]}" "$ACTIVE_SSH_WS_SSL_PORT"
     "$XRAY_VMESS_PORT" "$XRAY_VLESS_PORT" "$XRAY_TROJAN_PORT"
   )
@@ -229,11 +371,20 @@ open_firewall_ports() {
 
 set_state() {
   local key=$1 value=$2
+  mkdir -p "$(dirname "$STATE_FILE")"
+  [[ -f "$STATE_FILE" ]] || touch "$STATE_FILE"
+
+  local tmp
+  tmp=$(mktemp)
+
   if grep -q "^${key}=" "$STATE_FILE"; then
-    sed -i "s#^${key}=.*#${key}=${value}#" "$STATE_FILE"
+    grep -v "^${key}=" "$STATE_FILE" >"$tmp"
   else
-    echo "${key}=${value}" >>"$STATE_FILE"
+    cat "$STATE_FILE" >"$tmp"
   fi
+
+  printf '%s=%s\n' "$key" "$value" >>"$tmp"
+  mv "$tmp" "$STATE_FILE"
 }
 
 get_state() {
@@ -266,23 +417,20 @@ ensure_permission() {
     if [[ "$stored" == "$PERMISSION_TOKEN" ]]; then
       return 0
     fi
-  fi
-
-  if [[ -t 0 ]]; then
-    local input
-    read -rsp "Masukkan kode izin admin: " input
-    echo
-    if [[ "$input" != "$PERMISSION_TOKEN" ]]; then
-      error "Kode izin salah."
+    if [[ ! -t 0 ]]; then
+      error "Kode izin tersimpan berbeda dengan token yang diberikan. Jalankan di mode interaktif atau perbarui token secara manual."
       exit 1
     fi
-    echo "$PERMISSION_TOKEN" >"$PERMISSION_FLAG_FILE"
-    chmod 600 "$PERMISSION_FLAG_FILE"
-    ok "Izin diverifikasi."
-  else
-    error "Izin belum diverifikasi dan tidak dapat meminta input di mode non-interaktif."
-    exit 1
+    read -rp "Kode izin tersimpan berbeda. Gunakan kode baru dari lingkungan? [y/N]: " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+      error "Izin tidak diperbarui karena token tidak cocok."
+      exit 1
+    fi
   fi
+
+  echo "$PERMISSION_TOKEN" >"$PERMISSION_FLAG_FILE"
+  chmod 600 "$PERMISSION_FLAG_FILE"
+  ok "Izin diverifikasi."
 }
 
 # === OpenSSH ===
@@ -436,10 +584,12 @@ install_dropbear() {
 install_dropbear_ws() {
   info "Menyiapkan WebSocket untuk Dropbear..."
   local ws1 ws2
-  ws1=$(ensure_port_available "$DROPBEAR_WS_PORT1" tcp) || return 1
-  ws2=$(ensure_port_available "$DROPBEAR_WS_PORT2" tcp) || return 1
+  ws1=$(ensure_port_available "$DROPBEAR_WS_PORT1" tcp "$(generate_random_port)") || return 1
+  ws2=$(ensure_port_available "$DROPBEAR_WS_PORT2" tcp "$(generate_random_port)") || return 1
   ACTIVE_DROPBEAR_WS_PORT1="$ws1"
   ACTIVE_DROPBEAR_WS_PORT2="$ws2"
+  set_state dropbear_ws_port1 "$ACTIVE_DROPBEAR_WS_PORT1"
+  set_state dropbear_ws_port2 "$ACTIVE_DROPBEAR_WS_PORT2"
   cat >/etc/systemd/system/dropbear-ws.service <<WS
 [Unit]
 Description=Dropbear WebSocket Proxy ${ws1}->${DROPBEAR_PORT1}
@@ -487,13 +637,26 @@ UDP
 }
 
 start_ssh_udp() {
-  local port=$1
+  local port=$1 fallback=${2:-}
   local chosen
-  chosen=$(ensure_port_available "$port" udp) || return 1
-  echo "$chosen" >>"$SSH_UDP_STATE_FILE"
+  chosen=$(ensure_port_available "$port" udp "$fallback") || return 1
+  touch "$SSH_UDP_STATE_FILE"
+  if ! grep -qx "$chosen" "$SSH_UDP_STATE_FILE" 2>/dev/null; then
+    echo "$chosen" >>"$SSH_UDP_STATE_FILE"
+  fi
   systemctl enable ssh-udp@"$chosen"
   systemctl restart ssh-udp@"$chosen"
   ok "SSH over UDP aktif di port $chosen"
+}
+
+reset_ssh_udp_state() {
+  if [[ -f "$SSH_UDP_STATE_FILE" ]]; then
+    while IFS= read -r existing; do
+      [[ -z "$existing" ]] && continue
+      systemctl disable --now ssh-udp@"$existing" 2>/dev/null || true
+    done <"$SSH_UDP_STATE_FILE"
+  fi
+  : >"$SSH_UDP_STATE_FILE"
 }
 
 configure_ssh_udp_menu() {
@@ -504,7 +667,10 @@ configure_ssh_udp_menu() {
   echo "3. Nonaktifkan semua"
   read -rp "Pilih: " opt
   case $opt in
-    1) start_ssh_udp "$SSH_UDP_DEFAULT_PORT" ;;
+    1)
+       reset_ssh_udp_state
+       start_ssh_udp "$SSH_UDP_DEFAULT_PORT" "$(generate_random_port)"
+       ;;
     2) read -rp "Port atau range (contoh 5300-5302): " pr;
        if [[ $pr == *-* ]]; then
          local start end
@@ -758,10 +924,20 @@ OVPN
 
 install_openvpn() {
   info "Menyiapkan OpenVPN..."
+  local tcp_port udp_port ssl_port
+  tcp_port=$(ensure_port_available "$OVPN_TCP_PORT" tcp "$(generate_random_port)") || return 1
+  udp_port=$(ensure_port_available "$OVPN_UDP_PORT" udp "$(generate_random_port)") || return 1
+  ssl_port=$(ensure_port_available "$OVPN_SSL_PORT" tcp "$(generate_random_port)") || return 1
+  ACTIVE_OVPN_TCP_PORT="$tcp_port"
+  ACTIVE_OVPN_UDP_PORT="$udp_port"
+  ACTIVE_OVPN_SSL_PORT="$ssl_port"
+  set_state ovpn_tcp_port "$ACTIVE_OVPN_TCP_PORT"
+  set_state ovpn_udp_port "$ACTIVE_OVPN_UDP_PORT"
+  set_state ovpn_ssl_port "$ACTIVE_OVPN_SSL_PORT"
   setup_easy_rsa
   mkdir -p /etc/openvpn/server
   cat >/etc/openvpn/server/tcp.conf <<OVPN
-port $OVPN_TCP_PORT
+port $ACTIVE_OVPN_TCP_PORT
 proto tcp
 dev tun
 ca /etc/openvpn/easy-rsa/pki/ca.crt
@@ -778,7 +954,7 @@ status /var/log/openvpn-tcp-status.log
 log-append /var/log/openvpn-tcp.log
 OVPN
   cat >/etc/openvpn/server/udp.conf <<OVPN
-port $OVPN_UDP_PORT
+port $ACTIVE_OVPN_UDP_PORT
 proto udp
 dev tun
 ca /etc/openvpn/easy-rsa/pki/ca.crt
@@ -795,7 +971,7 @@ status /var/log/openvpn-udp-status.log
 log-append /var/log/openvpn-udp.log
 OVPN
   cat >/etc/openvpn/server/ssl.conf <<OVPN
-port $OVPN_SSL_PORT
+port $ACTIVE_OVPN_SSL_PORT
 proto tcp
 dev tun
 ca /etc/openvpn/easy-rsa/pki/ca.crt
@@ -813,9 +989,9 @@ log-append /var/log/openvpn-ssl.log
 OVPN
   systemctl enable openvpn-server@tcp openvpn-server@udp openvpn-server@ssl || true
   systemctl restart openvpn-server@tcp openvpn-server@udp openvpn-server@ssl || true
-  generate_client_config tcp "$OVPN_TCP_PORT" /etc/openvpn/client-tcp.ovpn
-  generate_client_config udp "$OVPN_UDP_PORT" /etc/openvpn/client-udp.ovpn
-  generate_client_config tcp "$OVPN_SSL_PORT" /etc/openvpn/client-ssl.ovpn
+  generate_client_config tcp "$ACTIVE_OVPN_TCP_PORT" /etc/openvpn/client-tcp.ovpn
+  generate_client_config udp "$ACTIVE_OVPN_UDP_PORT" /etc/openvpn/client-udp.ovpn
+  generate_client_config tcp "$ACTIVE_OVPN_SSL_PORT" /etc/openvpn/client-ssl.ovpn
 }
 
 update_script() {
@@ -837,9 +1013,9 @@ list_openvpn_clients() {
 }
 
 regenerate_openvpn_clients() {
-  generate_client_config tcp "$OVPN_TCP_PORT" /etc/openvpn/client-tcp.ovpn
-  generate_client_config udp "$OVPN_UDP_PORT" /etc/openvpn/client-udp.ovpn
-  generate_client_config tcp "$OVPN_SSL_PORT" /etc/openvpn/client-ssl.ovpn
+  generate_client_config tcp "$ACTIVE_OVPN_TCP_PORT" /etc/openvpn/client-tcp.ovpn
+  generate_client_config udp "$ACTIVE_OVPN_UDP_PORT" /etc/openvpn/client-udp.ovpn
+  generate_client_config tcp "$ACTIVE_OVPN_SSL_PORT" /etc/openvpn/client-ssl.ovpn
   ok "File client OpenVPN diperbarui"
 }
 
@@ -885,8 +1061,9 @@ BAD
 install_websocket_services() {
   info "Menyiapkan SSH WebSocket..."
   local wss_port
-  wss_port=$(ensure_port_available "$SSH_WS_SSL_PORT" tcp) || return 1
+  wss_port=$(ensure_port_available "$SSH_WS_SSL_PORT" tcp "$(generate_random_port)") || return 1
   ACTIVE_SSH_WS_SSL_PORT="$wss_port"
+  set_state ssh_ws_ssl_port "$ACTIVE_SSH_WS_SSL_PORT"
   for port in "${SSH_WS_PORTS[@]}"; do
     cat >/etc/systemd/system/ssh-ws@$port.service <<WSS
 [Unit]
@@ -1048,9 +1225,9 @@ show_service_info() {
   echo "Dropbear       : $DROPBEAR_PORT1, $DROPBEAR_PORT2"
   echo "Dropbear WS    : $ACTIVE_DROPBEAR_WS_PORT1, $ACTIVE_DROPBEAR_WS_PORT2"
   echo "SSH over UDP   : $(tr '\n' ' ' <"$SSH_UDP_STATE_FILE" 2>/dev/null || echo "$SSH_UDP_DEFAULT_PORT")"
-  echo "OpenVPN SSL    : $OVPN_SSL_PORT"
-  echo "OpenVPN TCP    : $OVPN_TCP_PORT"
-  echo "OpenVPN UDP    : $OVPN_UDP_PORT"
+  echo "OpenVPN SSL    : $ACTIVE_OVPN_SSL_PORT"
+  echo "OpenVPN TCP    : $ACTIVE_OVPN_TCP_PORT"
+  echo "OpenVPN UDP    : $ACTIVE_OVPN_UDP_PORT"
   echo "BadVPN UDPGW   : ${BADVPN_PORTS[*]}"
   echo "SSH WS         : ${SSH_WS_PORTS[*]}"
   echo "SSH WS SSL     : $ACTIVE_SSH_WS_SSL_PORT"
@@ -1706,6 +1883,46 @@ MENU
 
 show_main_menu() { show_dashboard; }
 
+verify_installation() {
+  info "Memverifikasi hasil instalasi menyeluruh..."
+  assert_service_active ssh "OpenSSH"
+  assert_service_active dropbear "Dropbear"
+  assert_service_active dropbear-ws "Dropbear WebSocket (${ACTIVE_DROPBEAR_WS_PORT1})"
+  assert_service_active dropbear-ws109 "Dropbear WebSocket (${ACTIVE_DROPBEAR_WS_PORT2})"
+
+  for port in "${SSH_WS_PORTS[@]}"; do
+    assert_service_active "ssh-ws@$port" "SSH WebSocket ($port)"
+  done
+  assert_service_active ssh-wss "SSH WebSocket TLS (${ACTIVE_SSH_WS_SSL_PORT})"
+
+  assert_service_active xray "Xray"
+  assert_service_active haproxy "HAProxy"
+  assert_service_active nginx "Nginx"
+
+  assert_file_exists "$XRAY_CERT_FILE" "sertifikat SSL XRAY"
+  assert_file_exists "$XRAY_KEY_FILE" "private key XRAY"
+
+  assert_service_active openvpn-server@tcp "OpenVPN TCP"
+  assert_service_active openvpn-server@udp "OpenVPN UDP"
+  assert_service_active openvpn-server@ssl "OpenVPN SSL"
+
+  if [[ -s "$SSH_UDP_STATE_FILE" ]]; then
+    while IFS= read -r udp_port; do
+      [[ -z "$udp_port" ]] && continue
+      assert_service_active "ssh-udp@$udp_port" "SSH over UDP ($udp_port)"
+    done <"$SSH_UDP_STATE_FILE"
+  else
+    error "SSH over UDP belum tercatat atau gagal diaktifkan."
+    exit 1
+  fi
+
+  for p in "${BADVPN_PORTS[@]}"; do
+    assert_service_active "badvpn@$p" "BadVPN UDPGW ($p)"
+  done
+
+  ok "Verifikasi selesai, semua layanan utama aktif."
+}
+
 # === Entry Point ===
 case "${1:-menu}" in
   --auto-backup)
@@ -1714,17 +1931,19 @@ case "${1:-menu}" in
     ;;
   install)
     check_root; check_os; check_arch; init_state; ensure_permission
-    install_dependencies
-    install_openssh
-    install_dropbear
-    install_dropbear_ws
-    install_ssh_udp_template
-    start_ssh_udp "$SSH_UDP_DEFAULT_PORT"
-    install_xray
-    install_openvpn
-    install_badvpn
-    install_websocket_services
+  install_dependencies
+  install_openssh
+  install_dropbear
+  install_dropbear_ws
+  install_ssh_udp_template
+  reset_ssh_udp_state
+  start_ssh_udp "$SSH_UDP_DEFAULT_PORT" "$(generate_random_port)"
+  install_xray
+  install_openvpn
+  install_badvpn
+  install_websocket_services
     open_firewall_ports
+    verify_installation
     ok "Instalasi selesai."
     ;;
   menu|*)
