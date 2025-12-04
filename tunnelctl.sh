@@ -40,6 +40,7 @@ ACTIVE_DROPBEAR_WS_PORT2="$DROPBEAR_WS_PORT2"
 ACTIVE_SSH_WS_SSL_PORT="$SSH_WS_SSL_PORT"
 VERSION_LABEL="4.0 LTS"
 CLIENT_LABEL="PRIVATE"
+declare -a ACME_STOPPED_SERVICES=()
 
 # === Utilitas Output ===
 info() { echo "[INFO] $*"; }
@@ -50,16 +51,23 @@ require_cmd() { command -v "$1" >/dev/null 2>&1 || { error "Perintah '$1' tidak 
 
 ensure_port_available() {
   local port=$1 proto=$2 fallback=${3:-}
+  local candidate=$port
+
   if ss -lntup | grep -q ":$port " 2>/dev/null; then
     if [[ -n "$fallback" ]]; then
-      info "Port $port/$proto sedang digunakan, menggunakan port cadangan $fallback."
-      echo "$fallback"
+      candidate=$fallback
+      while ss -lntup | grep -q ":$candidate " 2>/dev/null; do
+        info "Port $candidate/$proto juga digunakan, mencari port lain..."
+        candidate=$(generate_random_port)
+      done
+      info "Port $port/$proto sedang digunakan, menggunakan port cadangan $candidate."
+      echo "$candidate"
     else
       error "Port $port/$proto sedang digunakan."
       return 1
     fi
   else
-    echo "$port"
+    echo "$candidate"
   fi
 }
 
@@ -176,6 +184,38 @@ ensure_domain_configured() {
   fi
 }
 
+service_using_port() {
+  local port=$1 proto=$2
+  ss -l${proto}np 2>/dev/null | awk -v p=":$port" 'index($0,p)>0 { if (match($0, /users:\(\("([^"]+)"/, m)) { print m[1]; exit } }'
+}
+
+ensure_acme_ports_available() {
+  ACME_STOPPED_SERVICES=()
+  for port in 80 443; do
+    ufw allow "$port"/tcp >/dev/null 2>&1 || true
+    iptables -I INPUT -p tcp --dport "$port" -j ACCEPT || true
+
+    local svc
+    svc=$(service_using_port "$port" t)
+    if [[ -n "$svc" ]]; then
+      info "Port $port/tcp digunakan oleh layanan $svc; menghentikan sementara untuk penerbitan sertifikat..."
+      systemctl stop "$svc" 2>/dev/null || killall -q "$svc" 2>/dev/null || true
+      ACME_STOPPED_SERVICES+=("$svc")
+    fi
+  done
+}
+
+restore_acme_services() {
+  if (( ${#ACME_STOPPED_SERVICES[@]} == 0 )); then
+    return
+  fi
+  for svc in "${ACME_STOPPED_SERVICES[@]}"; do
+    info "Menghidupkan kembali layanan $svc setelah penerbitan sertifikat..."
+    systemctl restart "$svc" 2>/dev/null || systemctl start "$svc" 2>/dev/null || true
+  done
+  ACME_STOPPED_SERVICES=()
+}
+
 obtain_ssl_certificate() {
   ensure_domain_configured
   local domain
@@ -189,14 +229,25 @@ obtain_ssl_certificate() {
 
   info "Mengambil sertifikat SSL via acme.sh untuk $domain..."
   if [[ ! -x /root/.acme.sh/acme.sh ]]; then
+    mkdir -p /root/.acme.sh
     curl https://acme-install.netlify.app/acme.sh -o /root/.acme.sh/acme.sh
     chmod +x /root/.acme.sh/acme.sh
     /root/.acme.sh/acme.sh --upgrade --auto-upgrade
   fi
 
   /root/.acme.sh/acme.sh --set-default-ca --server letsencrypt
-  /root/.acme.sh/acme.sh --issue -d "$domain" --standalone -k ec-256
-  /root/.acme.sh/acme.sh --installcert -d "$domain" --fullchainpath "$XRAY_CERT_FILE" --keypath "$XRAY_KEY_FILE" --ecc
+  ensure_acme_ports_available
+  if ! /root/.acme.sh/acme.sh --issue -d "$domain" --standalone -k ec-256; then
+    restore_acme_services
+    error "Gagal menerbitkan sertifikat. Pastikan port 80/443 dapat diakses dari internet."
+    exit 1
+  fi
+  if ! /root/.acme.sh/acme.sh --installcert -d "$domain" --fullchainpath "$XRAY_CERT_FILE" --keypath "$XRAY_KEY_FILE" --ecc; then
+    restore_acme_services
+    error "Gagal memasang sertifikat yang telah diterbitkan."
+    exit 1
+  fi
+  restore_acme_services
   chmod 600 "$XRAY_CERT_FILE" "$XRAY_KEY_FILE"
   cat "$XRAY_CERT_FILE" "$XRAY_KEY_FILE" > /etc/ssl/xray.pem
   chmod 600 /etc/ssl/xray.pem
@@ -436,8 +487,8 @@ install_dropbear() {
 install_dropbear_ws() {
   info "Menyiapkan WebSocket untuk Dropbear..."
   local ws1 ws2
-  ws1=$(ensure_port_available "$DROPBEAR_WS_PORT1" tcp) || return 1
-  ws2=$(ensure_port_available "$DROPBEAR_WS_PORT2" tcp) || return 1
+  ws1=$(ensure_port_available "$DROPBEAR_WS_PORT1" tcp "$(generate_random_port)") || return 1
+  ws2=$(ensure_port_available "$DROPBEAR_WS_PORT2" tcp "$(generate_random_port)") || return 1
   ACTIVE_DROPBEAR_WS_PORT1="$ws1"
   ACTIVE_DROPBEAR_WS_PORT2="$ws2"
   cat >/etc/systemd/system/dropbear-ws.service <<WS
