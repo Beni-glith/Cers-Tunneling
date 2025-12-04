@@ -121,7 +121,7 @@ JSON
   [[ -f "$STATE_FILE" ]] || touch "$STATE_FILE"
   TELEGRAM_BOT_TOKEN=$(get_state telegram_bot_token "$TELEGRAM_BOT_TOKEN")
   TELEGRAM_CHAT_ID=$(get_state telegram_chat_id "$TELEGRAM_CHAT_ID")
-  PERMISSION_TOKEN=$(get_state permission_token "")
+  PERMISSION_TOKEN=$(get_state permission_token "${PERMISSION_TOKEN:-}")
 }
 
 # === Validasi Awal ===
@@ -173,15 +173,30 @@ ensure_domain_configured() {
   mkdir -p "$STATE_DIR"
   local domain
   domain=$(cat "$STATE_DIR/domain" 2>/dev/null || true)
+
+  if [[ -z "$domain" && -n "${XRAY_DOMAIN:-}" ]]; then
+    domain=$XRAY_DOMAIN
+  fi
+  if [[ -z "$domain" && -n "${DOMAIN:-}" ]]; then
+    domain=$DOMAIN
+  fi
+
   if [[ -z "$domain" ]]; then
-    read -rp "Masukkan domain untuk SSL XRAY: " domain
-    if [[ -z "$domain" ]]; then
-      error "Domain wajib disetel agar SSL dapat dibuat."
+    if [[ -t 0 ]]; then
+      read -rp "Masukkan domain untuk SSL XRAY: " domain
+    else
+      error "Domain wajib disetel agar SSL dapat dibuat. Set environment variable XRAY_DOMAIN atau DOMAIN."
       exit 1
     fi
-    echo "$domain" >"$STATE_DIR/domain"
-    ok "Domain tersimpan: $domain"
   fi
+
+  if [[ -z "$domain" ]]; then
+    error "Domain wajib disetel agar SSL dapat dibuat."
+    exit 1
+  fi
+
+  echo "$domain" >"$STATE_DIR/domain"
+  ok "Domain tersimpan: $domain"
 }
 
 service_using_port() {
@@ -317,23 +332,20 @@ ensure_permission() {
     if [[ "$stored" == "$PERMISSION_TOKEN" ]]; then
       return 0
     fi
-  fi
-
-  if [[ -t 0 ]]; then
-    local input
-    read -rsp "Masukkan kode izin admin: " input
-    echo
-    if [[ "$input" != "$PERMISSION_TOKEN" ]]; then
-      error "Kode izin salah."
+    if [[ ! -t 0 ]]; then
+      error "Kode izin tersimpan berbeda dengan token yang diberikan. Jalankan di mode interaktif atau perbarui token secara manual."
       exit 1
     fi
-    echo "$PERMISSION_TOKEN" >"$PERMISSION_FLAG_FILE"
-    chmod 600 "$PERMISSION_FLAG_FILE"
-    ok "Izin diverifikasi."
-  else
-    error "Izin belum diverifikasi dan tidak dapat meminta input di mode non-interaktif."
-    exit 1
+    read -rp "Kode izin tersimpan berbeda. Gunakan kode baru dari lingkungan? [y/N]: " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+      error "Izin tidak diperbarui karena token tidak cocok."
+      exit 1
+    fi
   fi
+
+  echo "$PERMISSION_TOKEN" >"$PERMISSION_FLAG_FILE"
+  chmod 600 "$PERMISSION_FLAG_FILE"
+  ok "Izin diverifikasi."
 }
 
 # === OpenSSH ===
