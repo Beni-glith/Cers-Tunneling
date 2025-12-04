@@ -71,6 +71,23 @@ ensure_port_available() {
   fi
 }
 
+assert_service_active() {
+  local svc=$1 desc=${2:-$1}
+  if ! systemctl is-active --quiet "$svc" 2>/dev/null; then
+    error "Layanan ${desc} tidak aktif setelah instalasi."
+    systemctl status "$svc" --no-pager 2>/dev/null || true
+    exit 1
+  fi
+}
+
+assert_file_exists() {
+  local path=$1 desc=${2:-$1}
+  if [[ ! -f "$path" ]]; then
+    error "File ${desc} tidak ditemukan setelah instalasi."
+    exit 1
+  fi
+}
+
 # Jalankan jq dan tulis ulang hasilnya ke file tanpa bergantung pada 'sponge'.
 jq_overwrite_file() {
   local file=$1
@@ -1769,6 +1786,46 @@ MENU
 
 show_main_menu() { show_dashboard; }
 
+verify_installation() {
+  info "Memverifikasi hasil instalasi menyeluruh..."
+  assert_service_active ssh "OpenSSH"
+  assert_service_active dropbear "Dropbear"
+  assert_service_active dropbear-ws "Dropbear WebSocket (${ACTIVE_DROPBEAR_WS_PORT1})"
+  assert_service_active dropbear-ws109 "Dropbear WebSocket (${ACTIVE_DROPBEAR_WS_PORT2})"
+
+  for port in "${SSH_WS_PORTS[@]}"; do
+    assert_service_active "ssh-ws@$port" "SSH WebSocket ($port)"
+  done
+  assert_service_active ssh-wss "SSH WebSocket TLS (${ACTIVE_SSH_WS_SSL_PORT})"
+
+  assert_service_active xray "Xray"
+  assert_service_active haproxy "HAProxy"
+  assert_service_active nginx "Nginx"
+
+  assert_file_exists "$XRAY_CERT_FILE" "sertifikat SSL XRAY"
+  assert_file_exists "$XRAY_KEY_FILE" "private key XRAY"
+
+  assert_service_active openvpn-server@tcp "OpenVPN TCP"
+  assert_service_active openvpn-server@udp "OpenVPN UDP"
+  assert_service_active openvpn-server@ssl "OpenVPN SSL"
+
+  if [[ -s "$SSH_UDP_STATE_FILE" ]]; then
+    while IFS= read -r udp_port; do
+      [[ -z "$udp_port" ]] && continue
+      assert_service_active "ssh-udp@$udp_port" "SSH over UDP ($udp_port)"
+    done <"$SSH_UDP_STATE_FILE"
+  else
+    error "SSH over UDP belum tercatat atau gagal diaktifkan."
+    exit 1
+  fi
+
+  for p in "${BADVPN_PORTS[@]}"; do
+    assert_service_active "badvpn@$p" "BadVPN UDPGW ($p)"
+  done
+
+  ok "Verifikasi selesai, semua layanan utama aktif."
+}
+
 # === Entry Point ===
 case "${1:-menu}" in
   --auto-backup)
@@ -1788,6 +1845,7 @@ case "${1:-menu}" in
     install_badvpn
     install_websocket_services
     open_firewall_ports
+    verify_installation
     ok "Instalasi selesai."
     ;;
   menu|*)
